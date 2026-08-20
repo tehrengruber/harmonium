@@ -846,21 +846,6 @@ impl Workspace {
             .bg(theme::panel_bg())
             .border_r_1()
             .border_color(theme::border())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(theme::border())
-                    .child(
-                        div()
-                            .text_color(theme::fg())
-                            .text_sm()
-                            .child("Projects"),
-                    ),
-            )
             .child(div().flex_1().overflow_hidden().child(list))
             .child(
                 div()

@@ -1,3 +1,4 @@
+mod assets;
 mod input;
 mod planner;
 mod state;
@@ -30,7 +31,7 @@ fn main() {
         return;
     }
 
-    Application::new().run(|cx: &mut App| {
+    Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
 
@@ -68,7 +69,21 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |_window, cx| cx.new(workspace::Workspace::new),
+            |window, cx| {
+                let workspace = cx.new(workspace::Workspace::new);
+                // A window-manager close (e.g. i3 `kill` sending
+                // WM_DELETE_WINDOW) only reaches us through this hook; gpui
+                // removes the window — and drops the workspace — before any
+                // app-quit observer runs, so the session is saved here.
+                window.on_window_should_close(cx, {
+                    let workspace = workspace.clone();
+                    move |_, cx| {
+                        workspace.update(cx, |workspace, cx| workspace.save_session(cx));
+                        true
+                    }
+                });
+                workspace
+            },
         )
         .expect("failed to open window");
         cx.activate(true);

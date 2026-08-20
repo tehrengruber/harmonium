@@ -44,7 +44,10 @@ impl TerminalView {
             && keystroke.modifiers.shift
             && keystroke.key == "c"
         {
-            if let Some(text) = self.terminal.read(cx).selection_text() {
+            let selected = self
+                .terminal
+                .update(cx, |terminal, _| terminal.selection_text());
+            if let Some(text) = selected {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
             }
             cx.stop_propagation();

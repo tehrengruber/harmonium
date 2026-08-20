@@ -7,18 +7,20 @@ pub mod view;
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Point as GridPoint, Side};
+use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Rgb as AnsiRgb};
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
+use crate::state;
 use futures::StreamExt as _;
 use gpui::{
     px, App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, Keystroke, Pixels,
-    Size,
+    Size, Task,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -93,9 +95,74 @@ impl EventListener for EventProxy {
 pub enum TerminalEvent {
     Exited,
     TitleChanged,
+    /// The child wrote to the PTY. Emitted on every wakeup, which is what
+    /// makes "the resumed process has painted something" observable.
+    Output,
+}
+
+/// A selection drag held outside the viewport: how many lines to scroll per
+/// tick (positive scrolls up into the scrollback) plus the pointer's column,
+/// so the selection can keep growing along the edge that scrolls into view.
+#[derive(Clone, Copy)]
+struct DragAutoscroll {
+    lines: i32,
+    column: Column,
+    side: Side,
+}
+
+/// Button code for "no button", used by motion reports and by the legacy
+/// encoding's release event.
+pub const NO_BUTTON: u8 = 3;
+
+/// A mouse event destined for a program that tracks the mouse. `button` uses
+/// the X11 numbering (0 left, 1 middle, 2 right, [`NO_BUTTON`] none); `row`
+/// and `column` are 0-based viewport cells.
+#[derive(Clone, Copy)]
+pub struct MouseReport {
+    pub button: u8,
+    pub pressed: bool,
+    pub motion: bool,
+    pub row: usize,
+    pub column: usize,
+    pub ctrl: bool,
+    pub alt: bool,
+}
+
+/// The user's selection, in absolute grid coordinates.
+///
+/// We keep this instead of leaving the selection in `Term`, because the
+/// parser throws `Term::selection` away whenever the program erases the
+/// region it covers (`ClearMode::Below`/`All`) — which for a full-screen
+/// inline TUI like the agent is *every redraw*, several times a second. A
+/// selection belongs to the user, not to the program, so ours is the source
+/// of truth and gets re-installed before every render and copy.
+#[derive(Clone, Copy)]
+struct SelectionState {
+    ty: SelectionType,
+    start: GridPoint,
+    start_side: Side,
+    end: GridPoint,
+    end_side: Side,
+}
+
+impl SelectionState {
+    fn build(&self) -> Selection {
+        let mut selection = Selection::new(self.ty, self.start, self.start_side);
+        selection.update(self.end, self.end_side);
+        selection
+    }
+
+    /// Follow the content when `delta` lines scroll off into the scrollback:
+    /// what sat on line `k` is on line `k - delta` afterwards.
+    fn shift(&mut self, delta: i32) {
+        self.start.line = Line(self.start.line.0 - delta);
+        self.end.line = Line(self.end.line.0 - delta);
+    }
 }
 
 pub struct Terminal {
+    /// Stable id (agent or tab id) naming the on-disk history file.
+    id: String,
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     sender: EventLoopSender,
     pub size: TerminalSize,
@@ -106,16 +173,44 @@ pub struct Terminal {
     /// Simple selections are created lazily on the first drag movement so a
     /// plain click doesn't highlight a single cell.
     pending_selection: Option<(GridPoint, Side)>,
+    /// The user's selection; see [`SelectionState`].
+    selection: Option<SelectionState>,
+    /// Scrollback size the selection was last aligned against, so output
+    /// arriving between two frames can be compensated for.
+    selection_history: usize,
+    /// Last cell reported to a mouse-tracking program, so motion is only
+    /// reported when the pointer actually changes cell.
+    last_mouse_cell: Option<(usize, usize)>,
+    /// A button press was forwarded to the program and not yet released.
+    /// Its release has to be forwarded too, wherever the pointer ends up —
+    /// but a release whose press we never sent must not leak through.
+    mouse_pressed: bool,
+    /// Set while a selection drag is held past the top/bottom edge; the task
+    /// repeats the scroll because a pointer held still emits no more events.
+    autoscroll: Option<DragAutoscroll>,
+    autoscroll_task: Option<Task<()>>,
+    /// Whether this terminal's scrollback is written to disk on shutdown and
+    /// replayed on the next start. Only shell tabs persist; agent terminals
+    /// resume via their own session command and repaint themselves.
+    persist_history: bool,
+    /// Cleared when the tab is removed for good, so dropping the entity
+    /// doesn't leave an orphaned history file behind.
+    save_history_on_drop: bool,
 }
 
 impl EventEmitter<TerminalEvent> for Terminal {}
 
 impl Terminal {
-    /// Spawn `program args...` in a fresh PTY rooted at `workdir`.
+    /// Spawn `program args...` in a fresh PTY rooted at `workdir`. `id` names
+    /// the history file written when this terminal is dropped; the file is
+    /// only written when `persist_history` is set.
     pub fn create(
+        id: String,
         program: String,
         args: Vec<String>,
+        env_overrides: Vec<(String, String)>,
         workdir: PathBuf,
+        persist_history: bool,
         cx: &mut App,
     ) -> Result<Entity<Terminal>> {
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
@@ -128,9 +223,16 @@ impl Terminal {
         };
         let term = Arc::new(FairMutex::new(Term::new(config, &size, proxy.clone())));
 
-        let mut env = HashMap::new();
-        env.insert("TERM".to_string(), "xterm-256color".to_string());
-        env.insert("COLORTERM".to_string(), "truecolor".to_string());
+        // Overrides only: alacritty's `tty::new` never calls `env_clear`, so
+        // the child already inherits our environment and these entries are
+        // applied on top of it. Copying the whole environment in here would
+        // also let an inherited WINDOWID clobber alacritty's per-PTY value.
+        let mut env: HashMap<String, String> = HashMap::from([
+            ("TERM".to_string(), "xterm-256color".to_string()),
+            ("COLORTERM".to_string(), "truecolor".to_string()),
+        ]);
+        // Anything configured on the command wins over our defaults.
+        env.extend(env_overrides);
 
         let options = PtyOptions {
             shell: Some(Shell::new(program.clone(), args)),
@@ -159,6 +261,7 @@ impl Terminal {
             .detach();
 
             Terminal {
+                id,
                 term,
                 sender,
                 size,
@@ -166,13 +269,24 @@ impl Terminal {
                 exited: false,
                 selecting: false,
                 pending_selection: None,
+                selection: None,
+                selection_history: 0,
+                last_mouse_cell: None,
+                mouse_pressed: false,
+                autoscroll: None,
+                autoscroll_task: None,
+                persist_history,
+                save_history_on_drop: true,
             }
         }))
     }
 
     fn process_event(&mut self, event: AlacEvent, cx: &mut Context<Self>) {
         match event {
-            AlacEvent::Wakeup => cx.notify(),
+            AlacEvent::Wakeup => {
+                cx.emit(TerminalEvent::Output);
+                cx.notify();
+            }
             AlacEvent::Title(title) => {
                 self.title = title;
                 cx.emit(TerminalEvent::TitleChanged);
@@ -225,13 +339,187 @@ impl Terminal {
         self.term.lock().resize(new_size);
     }
 
+    /// Capture and write this terminal's scrollback history to disk.
+    /// No-op for terminals that don't persist (agent sessions).
+    pub fn save_history(&self) {
+        if !self.persist_history {
+            return;
+        }
+        if let Err(error) = std::fs::create_dir_all(state::history_dir()) {
+            eprintln!("[harmonium] failed to create history dir: {error}");
+            return;
+        }
+        let path = state::terminal_history_path(&self.id);
+        let history = self.capture_history();
+        if history.is_empty() {
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+        // Trailing newline so the replayed shell's prompt starts on its own
+        // line: the shell redraws its prompt line on the first resize, which
+        // would otherwise erase the last history line sharing it.
+        let mut text = history.join("\n");
+        text.push('\n');
+        if let Err(error) = std::fs::write(&path, text) {
+            eprintln!("[harmonium] failed to write history {}: {error}", path.display());
+        }
+    }
+
+    /// Skip the history write on drop, leaving any file on disk untouched.
+    /// Used for a terminal that has been superseded: its replacement owns the
+    /// history file from now on and must not have it overwritten later.
+    pub fn forget_history(&mut self) {
+        self.save_history_on_drop = false;
+    }
+
+    /// Write the scrollback to disk right now and never again on drop, so a
+    /// replacement terminal spawned immediately after reads the current
+    /// contents rather than a stale file.
+    pub fn save_history_now(&mut self) {
+        self.save_history();
+        self.forget_history();
+    }
+
+    /// Skip the history write on drop and delete any saved file — used when
+    /// the tab is removed for good rather than the app shutting down.
+    pub fn discard_history(&mut self) {
+        self.save_history_on_drop = false;
+        let _ = std::fs::remove_file(state::terminal_history_path(&self.id));
+    }
+
+    /// Capture all lines currently in the terminal grid (scrollback + visible)
+    /// as ANSI-styled text: cell colors and attributes are re-encoded as SGR
+    /// escape sequences so a replay through the PTY restores the styling.
+    /// Trailing blank cells and trailing empty lines are trimmed.
+    pub fn capture_history(&self) -> Vec<String> {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::Line;
+
+        let style_flags = CellFlags::BOLD
+            | CellFlags::DIM
+            | CellFlags::ITALIC
+            | CellFlags::UNDERLINE
+            | CellFlags::INVERSE
+            | CellFlags::STRIKEOUT;
+        let default_style = (
+            AnsiColor::Named(NamedColor::Foreground),
+            AnsiColor::Named(NamedColor::Background),
+            CellFlags::empty(),
+        );
+
+        let term = self.term.lock();
+        let grid = term.grid();
+        let total = grid.total_lines();
+        let screen = grid.screen_lines();
+        let history = total.saturating_sub(screen);
+        let mut lines = Vec::with_capacity(total);
+
+        for i in 0..total {
+            // History lines have negative indices; visible lines are 0..screen-1.
+            let line_idx = Line(i as i32 - history as i32);
+            let row = &grid[line_idx];
+            let mut text = String::new();
+            // Byte length of `text` up to the last cell worth keeping, so
+            // trailing default-background blanks (and their escapes) drop off.
+            let mut keep = 0;
+            // Each line starts from the reset state; the previous line ends
+            // with a reset whenever it emitted any styling.
+            let mut current = default_style;
+            for cell in row.into_iter() {
+                if cell
+                    .flags
+                    .intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                let style = (cell.fg, cell.bg, cell.flags & style_flags);
+                if style != current {
+                    text.push_str(&sgr_sequence(cell.fg, cell.bg, cell.flags & style_flags));
+                    current = style;
+                }
+                let c = if cell.c == '\0' { ' ' } else { cell.c };
+                text.push(c);
+                // A space is only truly invisible on the default background
+                // without inverse/underline/strikeout styling.
+                let blank = c == ' '
+                    && cell.bg == default_style.1
+                    && !cell.flags.intersects(
+                        CellFlags::INVERSE | CellFlags::UNDERLINE | CellFlags::STRIKEOUT,
+                    );
+                if !blank {
+                    keep = text.len();
+                }
+            }
+            text.truncate(keep);
+            if text.contains('\x1b') {
+                text.push_str("\x1b[0m");
+            }
+            lines.push(text);
+        }
+
+        // Drop trailing empty lines.
+        while lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+            lines.pop();
+        }
+
+        lines
+    }
+
     pub fn scroll_lines(&mut self, delta: i32, cx: &mut Context<Self>) {
         self.term.lock().scroll_display(Scroll::Delta(delta));
         cx.notify();
     }
 
+    /// Handle a wheel scroll of `lines` (positive scrolls up/back) with the
+    /// pointer over viewport cell `row`/`column`, the way a real terminal
+    /// does — which is what makes the wheel work inside full-screen programs
+    /// like the agent TUI, where our own scrollback is empty:
+    ///
+    /// - the program tracks the mouse: report the wheel and let it scroll;
+    /// - alternate screen (no scrollback of its own) with alternate-scroll
+    ///   enabled: translate the wheel into arrow keys, like xterm;
+    /// - otherwise: move our viewport over the scrollback.
+    pub fn scroll_wheel(&mut self, lines: i32, row: usize, column: usize, cx: &mut Context<Self>) {
+        if lines == 0 {
+            return;
+        }
+        let mode = *self.term.lock().mode();
+        let count = lines.unsigned_abs() as usize;
+
+        if mode.intersects(TermMode::MOUSE_MODE) {
+            let button = if lines > 0 { 64 } else { 65 };
+            let mut bytes = Vec::new();
+            for _ in 0..count {
+                if let Some(report) = mouse_report(button, row, column, mode, true) {
+                    bytes.extend_from_slice(&report);
+                }
+            }
+            if !bytes.is_empty() {
+                self.write(bytes);
+            }
+            return;
+        }
+
+        if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+            let seq: &[u8] = match (lines > 0, mode.contains(TermMode::APP_CURSOR)) {
+                (true, true) => b"\x1bOA",
+                (true, false) => b"\x1b[A",
+                (false, true) => b"\x1bOB",
+                (false, false) => b"\x1b[B",
+            };
+            let mut bytes = Vec::with_capacity(seq.len() * count);
+            for _ in 0..count {
+                bytes.extend_from_slice(seq);
+            }
+            self.write(bytes);
+            return;
+        }
+
+        self.scroll_lines(lines, cx);
+    }
+
     pub fn paste(&mut self, text: &str) {
-        self.term.lock().selection = None;
+        self.clear_selection();
         let mode = *self.term.lock().mode();
         let bytes = if mode.contains(TermMode::BRACKETED_PASTE) {
             let mut b = b"\x1b[200~".to_vec();
@@ -256,7 +544,7 @@ impl Terminal {
         }
         let mode = *self.term.lock().mode();
         if let Some(bytes) = keystroke_to_bytes(keystroke, mode) {
-            self.term.lock().selection = None;
+            self.clear_selection();
             self.scroll_to_bottom();
             self.write(bytes);
             cx.notify();
@@ -275,16 +563,20 @@ impl Terminal {
         side: Side,
         cx: &mut Context<Self>,
     ) {
-        {
-            let mut term = self.term.lock();
-            if kind == SelectionType::Simple {
-                term.selection = None;
-                self.pending_selection = Some((point, side));
-            } else {
-                term.selection = Some(Selection::new(kind, point, side));
-                self.pending_selection = None;
-            }
+        if kind == SelectionType::Simple {
+            self.selection = None;
+            self.pending_selection = Some((point, side));
+        } else {
+            self.selection = Some(SelectionState {
+                ty: kind,
+                start: point,
+                start_side: side,
+                end: point,
+                end_side: side,
+            });
+            self.pending_selection = None;
         }
+        self.selection_history = self.term.lock().history_size();
         self.selecting = true;
         cx.notify();
     }
@@ -293,24 +585,177 @@ impl Terminal {
         if !self.selecting {
             return;
         }
-        {
-            let mut term = self.term.lock();
-            if let Some((start, start_side)) = self.pending_selection.take() {
-                term.selection = Some(Selection::new(SelectionType::Simple, start, start_side));
+        self.extend_selection(point, side);
+        cx.notify();
+    }
+
+    /// Move the selection's loose end, turning a pending simple selection
+    /// into a real one on the first drag.
+    fn extend_selection(&mut self, point: GridPoint, side: Side) {
+        if let Some((start, start_side)) = self.pending_selection.take() {
+            self.selection = Some(SelectionState {
+                ty: SelectionType::Simple,
+                start,
+                start_side,
+                end: point,
+                end_side: side,
+            });
+        } else if let Some(state) = self.selection.as_mut() {
+            state.end = point;
+            state.end_side = side;
+        }
+    }
+
+    /// Re-install the selection into the parser's term ahead of a render or
+    /// a copy, compensating for output that scrolled into the scrollback
+    /// since the last sync. The parser may drop or rotate the copy it holds
+    /// at any time — ours is authoritative and overwrites it here.
+    pub fn sync_selection(&mut self) {
+        let term = self.term.clone();
+        let mut term = term.lock();
+        let history = term.history_size();
+        if let Some(state) = self.selection.as_mut() {
+            let delta = history as i32 - self.selection_history as i32;
+            if delta != 0 {
+                state.shift(delta);
             }
-            if let Some(selection) = term.selection.as_mut() {
-                selection.update(point, side);
+            term.selection = Some(state.build());
+        } else {
+            term.selection = None;
+        }
+        self.selection_history = history;
+    }
+
+    /// Drop the selection, e.g. because the user typed or pasted.
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.pending_selection = None;
+        self.term.lock().selection = None;
+    }
+
+    /// Whether the running program asked to receive mouse events. Callers
+    /// still decide: holding shift takes the mouse back for a terminal-side
+    /// selection, exactly as in xterm and VTE.
+    pub fn wants_mouse(&self) -> bool {
+        self.term.lock().mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// Whether a forwarded press is still outstanding; see [`Self::mouse_pressed`].
+    pub fn mouse_pressed(&self) -> bool {
+        self.mouse_pressed
+    }
+
+    /// Forward a press, release or motion to a program that tracks the mouse,
+    /// so it can run its own selection and scrolling (which is how full-screen
+    /// TUIs let you select their own scrollback).
+    pub fn report_mouse(&mut self, report: MouseReport) {
+        let mode = *self.term.lock().mode();
+        if !mode.intersects(TermMode::MOUSE_MODE) {
+            return;
+        }
+        if report.motion {
+            // 1002 reports motion only while a button is held, 1003 always.
+            let wanted = if report.button == NO_BUTTON {
+                mode.contains(TermMode::MOUSE_MOTION)
+            } else {
+                mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
+            };
+            if !wanted || self.last_mouse_cell == Some((report.row, report.column)) {
+                return;
             }
         }
-        cx.notify();
+        self.last_mouse_cell = Some((report.row, report.column));
+        if !report.motion {
+            self.mouse_pressed = report.pressed;
+        }
+
+        let mut code = report.button;
+        if report.motion {
+            code += 32;
+        }
+        if report.alt {
+            code += 8;
+        }
+        if report.ctrl {
+            code += 16;
+        }
+        if let Some(bytes) = mouse_report(code, report.row, report.column, mode, report.pressed) {
+            self.write(bytes);
+        }
     }
 
     pub fn end_selection(&mut self) {
         self.selecting = false;
         self.pending_selection = None;
+        // Dropping the task cancels the timer.
+        self.autoscroll = None;
+        self.autoscroll_task = None;
     }
 
-    pub fn selection_text(&self) -> Option<String> {
+    /// Drive scrolling for a drag held past the top or bottom edge: `spec` is
+    /// `(lines per tick, pointer column, side)`, or `None` once the pointer is
+    /// back inside the viewport. A pointer resting outside emits no further
+    /// mouse events, so the scroll has to repeat on its own.
+    pub fn set_drag_autoscroll(
+        &mut self,
+        spec: Option<(i32, Column, Side)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((lines, column, side)) = spec else {
+            self.autoscroll = None;
+            self.autoscroll_task = None;
+            return;
+        };
+        let already_running = self.autoscroll.is_some();
+        self.autoscroll = Some(DragAutoscroll { lines, column, side });
+        if already_running {
+            return;
+        }
+        self.autoscroll_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(40))
+                    .await;
+                let keep_scrolling = this
+                    .update(cx, |terminal, cx| terminal.autoscroll_tick(cx))
+                    .unwrap_or(false);
+                if !keep_scrolling {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// One auto-scroll step: move the viewport, then drag the selection's end
+    /// onto the line that just scrolled into view at that edge.
+    fn autoscroll_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(autoscroll) = self.autoscroll else {
+            return false;
+        };
+        if !self.selecting {
+            self.autoscroll = None;
+            return false;
+        }
+        let point = {
+            let mut term = self.term.lock();
+            term.scroll_display(Scroll::Delta(autoscroll.lines));
+            let display_offset = term.grid().display_offset() as i32;
+            // Scrollback lines are negative: the top visible line is
+            // `-display_offset`, the bottom one `screen_lines - 1` below it.
+            let line = if autoscroll.lines > 0 {
+                Line(-display_offset)
+            } else {
+                Line(term.screen_lines() as i32 - 1 - display_offset)
+            };
+            GridPoint::new(line, autoscroll.column)
+        };
+        self.extend_selection(point, autoscroll.side);
+        cx.notify();
+        true
+    }
+
+    pub fn selection_text(&mut self) -> Option<String> {
+        self.sync_selection();
         self.term
             .lock()
             .selection_to_string()
@@ -322,8 +767,123 @@ impl Terminal {
     }
 }
 
+/// Encode a mouse event for a program that requested mouse reporting.
+/// `button` follows the X11 numbering (64/65 are wheel up/down); `row` and
+/// `column` are 0-based viewport cells. The legacy encoding can't express
+/// coordinates past 222, in which case no report is sent.
+fn mouse_report(
+    button: u8,
+    row: usize,
+    column: usize,
+    mode: TermMode,
+    pressed: bool,
+) -> Option<Vec<u8>> {
+    if mode.contains(TermMode::SGR_MOUSE) {
+        // SGR distinguishes press from release by the final byte, so the
+        // button survives into the release event.
+        let final_byte = if pressed { 'M' } else { 'm' };
+        Some(format!("\x1b[<{button};{};{}{final_byte}", column + 1, row + 1).into_bytes())
+    } else if row < 223 && column < 223 {
+        // The legacy encoding has no release button: 3 means "let go", and
+        // which button it was is lost.
+        let button = if pressed { button } else { 3 | (button & !0b11) };
+        Some(vec![
+            0x1b,
+            b'[',
+            b'M',
+            32 + button,
+            (32 + 1 + column) as u8,
+            (32 + 1 + row) as u8,
+        ])
+    } else {
+        None
+    }
+}
+
+/// Encode a cell style as one SGR sequence, starting from the reset state.
+/// Default foreground/background are covered by the leading `0`.
+fn sgr_sequence(fg: AnsiColor, bg: AnsiColor, flags: CellFlags) -> String {
+    use std::fmt::Write as _;
+
+    let mut params = String::from("0");
+    for (flag, code) in [
+        (CellFlags::BOLD, 1),
+        (CellFlags::DIM, 2),
+        (CellFlags::ITALIC, 3),
+        (CellFlags::UNDERLINE, 4),
+        (CellFlags::INVERSE, 7),
+        (CellFlags::STRIKEOUT, 9),
+    ] {
+        if flags.contains(flag) {
+            let _ = write!(params, ";{code}");
+        }
+    }
+    for (color, foreground) in [(fg, true), (bg, false)] {
+        match color {
+            AnsiColor::Named(named) => {
+                if let Some(code) = named_sgr(named, foreground) {
+                    let _ = write!(params, ";{code}");
+                }
+            }
+            AnsiColor::Indexed(i) => {
+                let _ = write!(params, ";{};5;{i}", if foreground { 38 } else { 48 });
+            }
+            AnsiColor::Spec(rgb) => {
+                let _ = write!(
+                    params,
+                    ";{};2;{};{};{}",
+                    if foreground { 38 } else { 48 },
+                    rgb.r,
+                    rgb.g,
+                    rgb.b
+                );
+            }
+        }
+    }
+    format!("\x1b[{params}m")
+}
+
+/// SGR color code for a named color, or `None` for the terminal defaults
+/// (which the reset in [`sgr_sequence`] already restores). Dim variants map
+/// to their base color; the DIM attribute flag carries the dimming.
+fn named_sgr(named: NamedColor, foreground: bool) -> Option<u16> {
+    use NamedColor::*;
+    let (index, bright) = match named {
+        Black | DimBlack => (0, false),
+        Red | DimRed => (1, false),
+        Green | DimGreen => (2, false),
+        Yellow | DimYellow => (3, false),
+        Blue | DimBlue => (4, false),
+        Magenta | DimMagenta => (5, false),
+        Cyan | DimCyan => (6, false),
+        White | DimWhite => (7, false),
+        BrightBlack => (0, true),
+        BrightRed => (1, true),
+        BrightGreen => (2, true),
+        BrightYellow => (3, true),
+        BrightBlue => (4, true),
+        BrightMagenta => (5, true),
+        BrightCyan => (6, true),
+        BrightWhite => (7, true),
+        Foreground | Background | Cursor | BrightForeground | DimForeground => return None,
+    };
+    Some(match (foreground, bright) {
+        (true, false) => 30 + index,
+        (true, true) => 90 + index,
+        (false, false) => 40 + index,
+        (false, true) => 100 + index,
+    })
+}
+
+/// History is written when the entity is dropped: this covers graceful quit,
+/// tab/agent teardown, and the window being closed by the window manager
+/// (WM_DELETE_WINDOW), where gpui removes the window — and drops its entities —
+/// before `on_app_quit` observers run.
 impl Drop for Terminal {
     fn drop(&mut self) {
+        if self.save_history_on_drop {
+            self.save_history();
+        }
         self.shutdown();
     }
 }
@@ -591,3 +1151,4 @@ pub fn rgb_to_hsla(rgb: AnsiRgb) -> gpui::Hsla {
     }
     .into()
 }
+

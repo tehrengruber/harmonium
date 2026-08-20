@@ -7,12 +7,12 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
     fill, point, px, relative, size, App, Bounds, DispatchPhase, Element, Entity, GlobalElementId,
-    Hsla, InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, ScrollWheelEvent, ShapedLine, SharedString, Style,
-    StrikethroughStyle, TextRun, UnderlineStyle, Window,
+    Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, ShapedLine,
+    SharedString, Style, StrikethroughStyle, TextRun, UnderlineStyle, Window,
 };
 
-use super::{resolve_color, rgb_to_hsla, Terminal, TerminalSize};
+use super::{resolve_color, rgb_to_hsla, MouseReport, Terminal, TerminalSize, NO_BUTTON};
 use crate::theme;
 
 pub struct TerminalElement {
@@ -28,6 +28,9 @@ impl TerminalElement {
 
 pub struct PrepaintState {
     bounds: Bounds<Pixels>,
+    /// Registered so gpui's hit testing applies: anything painted on top
+    /// (the settings dialog, say) takes the mouse away from the terminal.
+    hitbox: Hitbox,
     line_height: Pixels,
     cell_width: Pixels,
     display_offset: i32,
@@ -59,6 +62,23 @@ fn grid_point_at(
         Side::Right
     };
     (GridPoint::new(Line(row - display_offset), Column(col)), side)
+}
+
+/// Lines to scroll per tick for a drag held `overshoot` past a viewport edge
+/// (positive above the top, negative below the bottom). `None` while the
+/// pointer is inside. Capped so a drag flung far off doesn't rocket through
+/// the whole scrollback.
+fn autoscroll_lines(overshoot: Pixels, line_height: Pixels) -> Option<i32> {
+    if overshoot == px(0.) {
+        return None;
+    }
+    let rows = (f32::from(overshoot.abs()) / f32::from(line_height)).ceil() as i32;
+    let magnitude = rows.clamp(1, 5);
+    Some(if overshoot > px(0.) {
+        magnitude
+    } else {
+        -magnitude
+    })
 }
 
 struct Cursor {
@@ -117,7 +137,12 @@ impl Element for TerminalElement {
             line_height,
             size: bounds.size,
         };
-        self.terminal.update(cx, |terminal, _| terminal.resize(new_size));
+        self.terminal.update(cx, |terminal, _| {
+            terminal.resize(new_size);
+            // The program may have erased the selection out of the parser
+            // since the last frame; put it back before reading the grid.
+            terminal.sync_selection();
+        });
 
         let default_bg = rgb_to_hsla(super::hex_to_rgb(super::default_bg_hex()));
         let num_rows = new_size.rows();
@@ -298,6 +323,7 @@ impl Element for TerminalElement {
 
         PrepaintState {
             bounds,
+            hitbox: window.insert_hitbox(bounds, HitboxBehavior::Normal),
             line_height,
             cell_width,
             display_offset: display_offset_out,
@@ -362,21 +388,8 @@ impl Element for TerminalElement {
             }
         }
 
-        // Mouse wheel scrolls the scrollback.
-        let terminal = self.terminal.clone();
+        let hitbox = prepaint.hitbox.clone();
         let hit_bounds = prepaint.bounds;
-        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _window, cx| {
-            if phase == DispatchPhase::Bubble && hit_bounds.contains(&event.position) {
-                let delta_y = event.delta.pixel_delta(line_height).y / line_height;
-                let delta = delta_y.round() as i32;
-                if delta != 0 {
-                    terminal.update(cx, |terminal, cx| terminal.scroll_lines(delta, cx));
-                }
-            }
-        });
-
-        // Mouse selection: press starts (double = word, triple = line),
-        // drag extends, release ends.
         let origin = prepaint.bounds.origin;
         let cell_width = prepaint.cell_width;
         let display_offset = prepaint.display_offset;
@@ -394,41 +407,167 @@ impl Element for TerminalElement {
             )
         };
 
+        // Viewport cell under the pointer: mouse reports are in viewport
+        // coordinates, not scrollback-relative grid ones.
+        let cell_at = move |position: Point<Pixels>| {
+            let (point, _) = at(position);
+            let row = (point.line.0 + display_offset).clamp(0, num_rows as i32 - 1) as usize;
+            (row, point.column.0)
+        };
+
+        // Mouse wheel: scrolls our scrollback, or is handed to the program
+        // when it tracks the mouse or owns the alternate screen. Shift always
+        // keeps the wheel for the terminal, as in xterm.
         let terminal = self.terminal.clone();
-        window.on_mouse_event(move |event: &MouseDownEvent, phase, _window, cx| {
-            if phase == DispatchPhase::Bubble
-                && event.button == MouseButton::Left
-                && hit_bounds.contains(&event.position)
-            {
-                let kind = match event.click_count {
-                    1 => SelectionType::Simple,
-                    2 => SelectionType::Semantic,
-                    _ => SelectionType::Lines,
-                };
-                let (grid_point, side) = at(event.position);
-                terminal.update(cx, |terminal, cx| {
-                    terminal.begin_selection(kind, grid_point, side, cx);
-                });
+        let scroll_hitbox = hitbox.clone();
+        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble && scroll_hitbox.should_handle_scroll(window) {
+                let delta_y = event.delta.pixel_delta(line_height).y / line_height;
+                let delta = delta_y.round() as i32;
+                if delta != 0 {
+                    let (row, column) = cell_at(event.position);
+                    let shift = event.modifiers.shift;
+                    terminal.update(cx, |terminal, cx| {
+                        if shift {
+                            terminal.scroll_lines(delta, cx);
+                        } else {
+                            terminal.scroll_wheel(delta, row, column, cx);
+                        }
+                    });
+                }
             }
         });
 
+        // Mouse buttons and motion go to the program whenever it tracks the
+        // mouse — that is how a full-screen TUI runs its own selection and
+        // scrolling. Holding shift takes the mouse back for a terminal-side
+        // selection, the xterm/VTE convention.
         let terminal = self.terminal.clone();
-        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
-            if phase == DispatchPhase::Bubble
-                && event.pressed_button == Some(MouseButton::Left)
-                && terminal.read(cx).selecting
-            {
+        let down_hitbox = hitbox.clone();
+        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble || !down_hitbox.is_hovered(window) {
+                return;
+            }
+            let button = match event.button {
+                MouseButton::Left => 0,
+                MouseButton::Middle => 1,
+                MouseButton::Right => 2,
+                _ => return,
+            };
+            let (row, column) = cell_at(event.position);
+            let forward = !event.modifiers.shift && terminal.read(cx).wants_mouse();
+            if forward {
+                let report = MouseReport {
+                    button,
+                    pressed: true,
+                    motion: false,
+                    row,
+                    column,
+                    ctrl: event.modifiers.control,
+                    alt: event.modifiers.alt,
+                };
+                terminal.update(cx, |terminal, _| terminal.report_mouse(report));
+                return;
+            }
+            if event.button != MouseButton::Left {
+                return;
+            }
+            let kind = match event.click_count {
+                1 => SelectionType::Simple,
+                2 => SelectionType::Semantic,
+                _ => SelectionType::Lines,
+            };
+            let (grid_point, side) = at(event.position);
+            terminal.update(cx, |terminal, cx| {
+                terminal.begin_selection(kind, grid_point, side, cx);
+            });
+        });
+
+        let terminal = self.terminal.clone();
+        let top = hit_bounds.origin.y;
+        let bottom = hit_bounds.origin.y + hit_bounds.size.height;
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble {
+                return;
+            }
+            // A drag that began as a selection stays one even if the program
+            // turns tracking on midway.
+            if !terminal.read(cx).selecting {
+                if !event.modifiers.shift
+                    && hitbox.is_hovered(window)
+                    && terminal.read(cx).wants_mouse()
+                {
+                    let (row, column) = cell_at(event.position);
+                    let report = MouseReport {
+                        button: match event.pressed_button {
+                            Some(MouseButton::Left) => 0,
+                            Some(MouseButton::Middle) => 1,
+                            Some(MouseButton::Right) => 2,
+                            _ => NO_BUTTON,
+                        },
+                        pressed: true,
+                        motion: true,
+                        row,
+                        column,
+                        ctrl: event.modifiers.control,
+                        alt: event.modifiers.alt,
+                    };
+                    terminal.update(cx, |terminal, _| terminal.report_mouse(report));
+                }
+                return;
+            }
+            if event.pressed_button == Some(MouseButton::Left) {
                 let (grid_point, side) = at(event.position);
+                // Past an edge the drag keeps scrolling on a timer: `at`
+                // clamps to the edge row, so without it the selection would
+                // simply stop at the top/bottom of the viewport.
+                let overshoot = if event.position.y < top {
+                    top - event.position.y
+                } else if event.position.y > bottom {
+                    bottom - event.position.y
+                } else {
+                    px(0.)
+                };
+                let autoscroll = autoscroll_lines(overshoot, line_height)
+                    .map(|lines| (lines, grid_point.column, side));
                 terminal.update(cx, |terminal, cx| {
                     terminal.drag_selection(grid_point, side, cx);
+                    terminal.set_drag_autoscroll(autoscroll, cx);
                 });
             }
         });
 
         let terminal = self.terminal.clone();
         window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
-            if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
-                terminal.update(cx, |terminal, _| terminal.end_selection());
+            if phase != DispatchPhase::Bubble {
+                return;
+            }
+            if terminal.read(cx).selecting {
+                if event.button == MouseButton::Left {
+                    terminal.update(cx, |terminal, _| terminal.end_selection());
+                }
+                return;
+            }
+            let button = match event.button {
+                MouseButton::Left => 0,
+                MouseButton::Middle => 1,
+                MouseButton::Right => 2,
+                _ => return,
+            };
+            // Only a release whose press we forwarded may be reported, or a
+            // click that landed on the sidebar or a dialog would leak through.
+            if terminal.read(cx).mouse_pressed() {
+                let (row, column) = cell_at(event.position);
+                let report = MouseReport {
+                    button,
+                    pressed: false,
+                    motion: false,
+                    row,
+                    column,
+                    ctrl: event.modifiers.control,
+                    alt: event.modifiers.alt,
+                };
+                terminal.update(cx, |terminal, _| terminal.report_mouse(report));
             }
         });
     }

@@ -1,19 +1,22 @@
 //! Root view: project/agent sidebar on the left, terminal pane on the right,
 //! modal dialogs for adding projects and spawning agents.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, App, AppContext as _, Context, Entity, FocusHandle, Focusable,
+    div, px, svg, App, AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window,
 };
 
 use crate::input::{InputEvent, TextInput};
 use crate::planner;
-use crate::state::{load_state, save_state, AgentId, AgentRecord, AppState, ProjectRecord};
+use crate::state::{
+    load_state, save_state, AgentId, AgentRecord, AppState, ProjectRecord, TerminalTabRecord,
+};
+use crate::state;
 use crate::terminal::view::TerminalView;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::theme;
@@ -34,6 +37,9 @@ enum Dialog {
         _subscription: Subscription,
     },
     Settings {
+        /// Focus target for the panel itself, so the modal always owns the
+        /// keyboard even when it has no input to focus (no presets yet).
+        focus_handle: FocusHandle,
         preset_inputs: Vec<PresetInputs>,
         _subscriptions: Vec<Subscription>,
     },
@@ -41,6 +47,14 @@ enum Dialog {
 
 const MIN_SIDEBAR_WIDTH: f32 = 180.;
 const MAX_SIDEBAR_WIDTH: f32 = 600.;
+
+/// A resolved command line for a terminal: the program to exec, its
+/// arguments, and any `KEY=value` prefixes that came with it.
+struct Spawn {
+    program: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+}
 
 /// Inline editing of an agent's name in the sidebar.
 struct InlineEdit {
@@ -51,8 +65,24 @@ struct InlineEdit {
 
 pub struct Workspace {
     state: AppState,
-    terminals: HashMap<AgentId, Entity<TerminalView>>,
-    terminal_subscriptions: HashMap<AgentId, Subscription>,
+    /// Live terminals, keyed by terminal id: the agent's own terminal uses
+    /// the agent id, extra shell tabs use their tab id.
+    terminals: HashMap<String, Entity<TerminalView>>,
+    terminal_subscriptions: HashMap<String, Subscription>,
+    /// Per agent: terminal id of the currently shown tab (defaults to the
+    /// agent id, i.e. the first tab).
+    active_tabs: HashMap<AgentId, String>,
+    /// Agent terminals that have been superseded by a resume: shut down, but
+    /// still rendered until the replacement emits its first output so the
+    /// previous screen doesn't flash blank. Presence here *is* the "not yet
+    /// painted" state — an entry is removed the moment the new terminal for
+    /// the same id emits an event. Only agent terminals appear here; shell
+    /// tabs are restarted from their history file instead, because a live and
+    /// an outgoing terminal would otherwise fight over one history file.
+    outgoing_terminals: HashMap<String, Entity<TerminalView>>,
+    /// Agents whose saved terminals have been spawned in this session.
+    /// Restoration is lazy: nothing is spawned until an agent is selected.
+    restored: HashSet<AgentId>,
     selected: Option<AgentId>,
     dialog: Option<Dialog>,
     inline_edit: Option<InlineEdit>,
@@ -68,17 +98,101 @@ impl Workspace {
             base: state.settings.font_size,
         });
         theme::set_mode(state.settings.theme);
-        Self {
+        let workspace = Self {
             state,
             terminals: HashMap::new(),
             terminal_subscriptions: HashMap::new(),
+            active_tabs: HashMap::new(),
+            outgoing_terminals: HashMap::new(),
+            restored: HashSet::new(),
             selected: None,
             dialog: None,
             inline_edit: None,
             resizing_sidebar: false,
             status: None,
             focus_handle: cx.focus_handle(),
+        };
+        cx.on_app_quit(|this, cx| {
+            this.persist(cx);
+            std::future::ready(())
+        })
+        .detach();
+        workspace
+    }
+
+    /// Write scrollback history for every live terminal and persist state.
+    /// Called from the window's should-close hook, which is the only signal
+    /// delivered on a window-manager close (i3 `kill`) before teardown.
+    pub fn save_session(&mut self, cx: &mut Context<Self>) {
+        for view in self.terminals.values() {
+            view.read(cx).terminal.read(cx).save_history();
         }
+        self.persist(cx);
+    }
+
+    /// Respawn the live processes for a saved agent: the agent session with
+    /// its stored resume command, plus one shell per saved tab replaying that
+    /// tab's history. Done lazily on first selection rather than for every
+    /// saved agent at startup, which would mean dozens of PTYs before the
+    /// first frame. A no-op once the agent has been restored this session.
+    fn restore_agent(&mut self, id: &AgentId, cx: &mut Context<Self>) {
+        if self.restored.contains(id) {
+            return;
+        }
+        let Some(record) = self.state.agent(id).cloned() else {
+            return;
+        };
+        self.restored.insert(id.clone());
+        let resume = record
+            .resume_command
+            .clone()
+            .unwrap_or_else(|| "claude --continue".into());
+        if !self.terminals.contains_key(id) {
+            self.start_agent_terminal(id, resume, Vec::new(), record.workdir.clone(), cx);
+        }
+        for tab in &record.terminals {
+            // Guard against restoring a tab that was just spawned by hand.
+            if !self.terminals.contains_key(&tab.id) {
+                self.start_shell_tab(&tab.id, &record.workdir, cx);
+            }
+        }
+        self.active_tabs
+            .entry(id.clone())
+            .or_insert_with(|| id.clone());
+    }
+
+    /// Spawn a shell tab, replaying any saved history file into the PTY first.
+    fn start_shell_tab(&mut self, id: &str, workdir: &Path, cx: &mut Context<Self>) {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let history_path = state::terminal_history_path(id);
+        let (program, args) = if history_path.exists() {
+            let quote = |s: &str| {
+                shlex::try_quote(s)
+                    .map(|q| q.into_owned())
+                    .unwrap_or_else(|_| s.to_string())
+            };
+            let path = quote(&history_path.to_string_lossy());
+            let shell = quote(&shell);
+            // `;` rather than `&&`: a `cat` that fails or is interrupted must
+            // not take the whole tab down with it — always exec the shell.
+            (
+                "/bin/sh".to_string(),
+                vec![
+                    "-c".to_string(),
+                    format!("cat {path} 2>/dev/null; exec {shell}"),
+                ],
+            )
+        } else {
+            // Passed as the program, never word-split: $SHELL is a path, not
+            // a command line.
+            (shell, Vec::new())
+        };
+        let spawn = Spawn {
+            program,
+            args,
+            env: Vec::new(),
+        };
+        self.start_terminal(id, spawn, workdir.to_path_buf(), true, cx);
     }
 
     fn set_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
@@ -183,11 +297,9 @@ impl Workspace {
         }
         let project = self.state.projects.remove(index);
         for agent in &project.agents {
-            self.terminals.remove(&agent.id);
-            self.terminal_subscriptions.remove(&agent.id);
-            if self.selected.as_ref() == Some(&agent.id) {
-                self.selected = None;
-            }
+            let tab_ids: Vec<String> =
+                agent.terminals.iter().map(|t| t.id.clone()).collect();
+            self.teardown_agent(&agent.id, &tab_ids, cx);
         }
         self.persist(cx);
         cx.notify();
@@ -215,10 +327,7 @@ impl Workspace {
                         this.spawn_agent(path.clone(), task, window, cx);
                     }
                 }
-                InputEvent::Cancelled => {
-                    this.dialog = None;
-                    cx.notify();
-                }
+                InputEvent::Cancelled => this.close_dialog(window, cx),
             },
         );
         window.focus(&input.focus_handle(cx));
@@ -246,6 +355,7 @@ impl Workspace {
         command: &str,
         resume_command: &str,
         subscriptions: &mut Vec<Subscription>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> PresetInputs {
         let mut make = |placeholder: &'static str, value: &str| {
@@ -256,14 +366,14 @@ impl Workspace {
                 }
                 input
             });
-            subscriptions.push(cx.subscribe(
+            // `subscribe_in` rather than `subscribe`: closing the dialog has
+            // to hand the keyboard back to the terminal, which needs a window.
+            subscriptions.push(cx.subscribe_in(
                 &input,
-                |this, _input, event: &InputEvent, cx| match event {
-                    InputEvent::Submitted(_) => this.save_settings(cx),
-                    InputEvent::Cancelled => {
-                        this.dialog = None;
-                        cx.notify();
-                    }
+                window,
+                |this, _input, event: &InputEvent, window, cx| match event {
+                    InputEvent::Submitted(_) => this.save_settings(window, cx),
+                    InputEvent::Cancelled => this.close_dialog(window, cx),
                 },
             ));
             input
@@ -275,10 +385,10 @@ impl Workspace {
         }
     }
 
-    fn open_settings_dialog(&mut self, cx: &mut Context<Self>) {
+    fn open_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let presets = self.state.settings.presets.clone();
         let mut subscriptions = Vec::new();
-        let preset_inputs = presets
+        let preset_inputs: Vec<PresetInputs> = presets
             .iter()
             .map(|p| {
                 self.make_preset_inputs(
@@ -286,23 +396,37 @@ impl Workspace {
                     &p.command,
                     &p.resume_command,
                     &mut subscriptions,
+                    window,
                     cx,
                 )
             })
             .collect();
+        // The dialog is modal, so it has to take the keyboard: without this
+        // the terminal keeps focus and typing goes into the PTY behind the
+        // dialog. Prefer the first field; fall back to the panel itself when
+        // there are no presets to focus.
+        let focus_handle = cx.focus_handle();
+        match preset_inputs.first() {
+            Some(first) => window.focus(&first.name.focus_handle(cx)),
+            None => window.focus(&focus_handle),
+        }
         self.dialog = Some(Dialog::Settings {
+            focus_handle,
             preset_inputs,
             _subscriptions: subscriptions,
         });
         cx.notify();
     }
 
-    fn add_preset_row(&mut self, cx: &mut Context<Self>) {
+    fn add_preset_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut subscriptions = Vec::new();
-        let inputs = self.make_preset_inputs("", "", "", &mut subscriptions, cx);
+        let inputs = self.make_preset_inputs("", "", "", &mut subscriptions, window, cx);
+        // Typing should land in the row that was just added.
+        window.focus(&inputs.name.focus_handle(cx));
         if let Some(Dialog::Settings {
             preset_inputs,
             _subscriptions,
+            ..
         }) = &mut self.dialog
         {
             preset_inputs.push(inputs);
@@ -320,7 +444,21 @@ impl Workspace {
         cx.notify();
     }
 
-    fn save_settings(&mut self, cx: &mut Context<Self>) {
+    /// Dismiss the open dialog and hand the keyboard back to the selected
+    /// agent's terminal — otherwise focus dies with the dialog's inputs and
+    /// typing goes nowhere until the terminal is clicked.
+    fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dialog = None;
+        if let Some(id) = self.selected.clone() {
+            if let Some(view) = self.active_terminal(&id) {
+                let handle = view.focus_handle(cx);
+                window.focus(&handle);
+            }
+        }
+        cx.notify();
+    }
+
+    fn save_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Dialog::Settings { preset_inputs, .. }) = &self.dialog else {
             return;
         };
@@ -347,7 +485,7 @@ impl Workspace {
             .settings
             .last_preset
             .min(self.state.settings.presets.len().saturating_sub(1));
-        self.dialog = None;
+        self.close_dialog(window, cx);
         self.persist(cx);
         cx.notify();
     }
@@ -455,6 +593,7 @@ impl Workspace {
             branch: workspace.branch.clone(),
             command: Some(command.clone()),
             resume_command: Some(resume_command),
+            terminals: Vec::new(),
         };
         let Some(project) = self
             .state
@@ -469,12 +608,72 @@ impl Workspace {
         project.expanded = true;
         self.persist(cx);
 
-        self.start_terminal(&id, command, vec![task], workspace.workdir, cx);
+        self.start_agent_terminal(&id, command, vec![task], workspace.workdir, cx);
+        // A brand-new agent has nothing saved to restore.
+        self.restored.insert(id.clone());
+        self.active_tabs.insert(id.clone(), id.clone());
         self.status = None;
         self.select_agent(id, window, cx);
     }
 
-    fn start_terminal(
+    /// Spawn a fresh shell in the agent's workdir for a new terminal tab.
+    fn add_terminal_tab(
+        &mut self,
+        agent_id: AgentId,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self.state.agent(&agent_id).cloned() else {
+            return;
+        };
+        let tab_id = uuid::Uuid::new_v4().to_string();
+        self.start_shell_tab(&tab_id, &record.workdir, cx);
+        if let Some(record) = self.state.agent_mut(&agent_id) {
+            record.terminals.push(TerminalTabRecord {
+                id: tab_id.clone(),
+                name: name.clone(),
+            });
+        }
+        self.active_tabs.insert(agent_id.clone(), tab_id.clone());
+        self.select_agent(agent_id, window, cx);
+        self.persist(cx);
+    }
+
+    /// Remove a terminal tab. Refuses to remove the agent's own first tab.
+    fn remove_terminal_tab(
+        &mut self,
+        agent_id: AgentId,
+        tab_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if tab_id == agent_id {
+            return;
+        }
+        if let Some(view) = self.terminals.remove(&tab_id) {
+            let terminal = view.read(cx).terminal.clone();
+            terminal.update(cx, |terminal, _| terminal.discard_history());
+        }
+        self.terminal_subscriptions.remove(&tab_id);
+        if let Some(record) = self.state.agent_mut(&agent_id) {
+            record.terminals.retain(|t| t.id != tab_id);
+        }
+        if self
+            .active_tabs
+            .get(&agent_id)
+            .map(|a| a == &tab_id)
+            .unwrap_or(false)
+        {
+            self.active_tabs.insert(agent_id.clone(), agent_id.clone());
+        }
+        self.persist(cx);
+        cx.notify();
+    }
+
+    /// Spawn an agent session terminal. Agent commands — and only agent
+    /// commands — are configured as a command *line*, so they are word-split
+    /// here and can be replaced wholesale by the test/debug override.
+    fn start_agent_terminal(
         &mut self,
         id: &str,
         command: String,
@@ -482,20 +681,67 @@ impl Workspace {
         workdir: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        // Test/debug override: replaces the preset command entirely.
+        // Test/debug override: replaces the preset command entirely. Scoped
+        // to agent terminals so it can't hijack shell tabs.
         let command = std::env::var("HARMONIUM_AGENT_BIN").unwrap_or(command);
         let mut parts = planner::split_command(&command);
+        // Leading `KEY=value` words are environment for the child, as in a
+        // shell — e.g. `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude`, which
+        // keeps the agent's output in the scrollback where it can be scrolled
+        // and selected.
+        let mut env = Vec::new();
+        while let Some(assignment) = parts.first().and_then(|word| split_assignment(word)) {
+            env.push(assignment);
+            parts.remove(0);
+        }
         if parts.is_empty() {
             self.set_status(format!("Empty agent command: `{command}`"), true, cx);
             return;
         }
         let program = parts.remove(0);
         parts.extend(extra_args);
-        match Terminal::create(program, parts, workdir, cx) {
+        let spawn = Spawn {
+            program,
+            args: parts,
+            env,
+        };
+        self.start_terminal(id, spawn, workdir, false, cx);
+    }
+
+    /// Spawn `program args...` — already resolved, never re-split — and wire
+    /// up the view and event subscription for terminal `id`.
+    fn start_terminal(
+        &mut self,
+        id: &str,
+        spawn: Spawn,
+        workdir: PathBuf,
+        persist_history: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match Terminal::create(
+            id.to_string(),
+            spawn.program,
+            spawn.args,
+            spawn.env,
+            workdir,
+            persist_history,
+            cx,
+        ) {
             Ok(terminal) => {
+                let terminal_id = id.to_string();
                 let subscription = cx.subscribe(
                     &terminal,
-                    |_this, _terminal, _event: &TerminalEvent, cx| cx.notify(),
+                    move |this, _terminal, event: &TerminalEvent, cx| {
+                        // Any event means this terminal has produced output,
+                        // which retires the outgoing snapshot for its id.
+                        this.terminal_painted(&terminal_id, cx);
+                        // Plain output already redraws the terminal view
+                        // itself; only title/exit change what the workspace
+                        // chrome renders.
+                        if !matches!(event, TerminalEvent::Output) {
+                            cx.notify();
+                        }
+                    },
                 );
                 let view = cx.new(|cx| TerminalView::new(terminal, cx));
                 self.terminals.insert(id.to_string(), view);
@@ -503,7 +749,7 @@ impl Workspace {
                     .insert(id.to_string(), subscription);
             }
             Err(error) => {
-                self.set_status(format!("Failed to spawn agent: {error}"), true, cx);
+                self.set_status(format!("Failed to spawn terminal: {error}"), true, cx);
             }
         }
     }
@@ -512,21 +758,99 @@ impl Workspace {
         let Some(record) = self.state.agent(&id).cloned() else {
             return;
         };
-        self.terminals.remove(&id);
-        self.terminal_subscriptions.remove(&id);
+
+        // Keep the agent terminal around as a snapshot so the previous output
+        // stays visible until the resumed process draws its first frame — but
+        // shut the superseded process down rather than letting it run on
+        // invisibly, and drop its subscription so only the *new* terminal's
+        // events can retire the snapshot.
+        if let Some(view) = self.terminals.remove(&id) {
+            self.terminal_subscriptions.remove(&id);
+            let terminal = view.read(cx).terminal.clone();
+            terminal.update(cx, |terminal, _| {
+                terminal.forget_history();
+                terminal.shutdown();
+            });
+            self.outgoing_terminals.insert(id.clone(), view);
+        }
+        // Shell tabs are *not* snapshotted: live and outgoing would share one
+        // history file, so the respawned tab would replay stale content and
+        // the outgoing terminal's drop would later clobber the fresh file.
+        // Instead, save each tab's scrollback now, shut it down and drop it;
+        // `start_shell_tab` below replays what was just written.
+        for tab in &record.terminals {
+            if let Some(view) = self.terminals.remove(&tab.id) {
+                self.terminal_subscriptions.remove(&tab.id);
+                let terminal = view.read(cx).terminal.clone();
+                terminal.update(cx, |terminal, _| {
+                    terminal.save_history_now();
+                    terminal.shutdown();
+                });
+            }
+        }
+
+        let workdir = record.workdir.clone();
         let resume = record
             .resume_command
+            .clone()
             .unwrap_or_else(|| "claude --continue".into());
-        self.start_terminal(&id, resume, Vec::new(), record.workdir, cx);
+        self.start_agent_terminal(&id, resume, Vec::new(), workdir.clone(), cx);
+        if !self.terminals.contains_key(&id) {
+            // The respawn failed; without the snapshot dropped, the "No live
+            // session / Resume" UI would be unreachable for a retry.
+            self.outgoing_terminals.remove(&id);
+        }
+        // Restart persisted extra tabs, replaying the history just written.
+        for tab in &record.terminals {
+            self.start_shell_tab(&tab.id, &workdir, cx);
+        }
+        self.restored.insert(id.clone());
+        self.active_tabs.insert(id.clone(), id.clone());
         cx.notify();
     }
 
-    fn remove_agent(&mut self, id: AgentId, cx: &mut Context<Self>) {
-        self.terminals.remove(&id);
-        self.terminal_subscriptions.remove(&id);
-        if self.selected.as_ref() == Some(&id) {
+    /// Called when a live terminal emits any event: its first output retires
+    /// the outgoing snapshot shown in its place.
+    fn terminal_painted(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.outgoing_terminals.remove(id).is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Shut down and forget every terminal belonging to an agent, along with
+    /// its per-agent UI state. History files are deleted: this is the "gone
+    /// for good" path, used when an agent or its whole project is removed.
+    fn teardown_agent(
+        &mut self,
+        id: &AgentId,
+        tab_ids: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        for terminal_id in std::iter::once(id.clone()).chain(tab_ids.iter().cloned()) {
+            self.terminal_subscriptions.remove(&terminal_id);
+            let views = [
+                self.terminals.remove(&terminal_id),
+                self.outgoing_terminals.remove(&terminal_id),
+            ];
+            for view in views.into_iter().flatten() {
+                let terminal = view.read(cx).terminal.clone();
+                terminal.update(cx, |terminal, _| terminal.discard_history());
+            }
+        }
+        self.active_tabs.remove(id);
+        self.restored.remove(id);
+        if self.selected.as_ref() == Some(id) {
             self.selected = None;
         }
+    }
+
+    fn remove_agent(&mut self, id: AgentId, cx: &mut Context<Self>) {
+        let tab_ids: Vec<String> = self
+            .state
+            .agent(&id)
+            .map(|record| record.terminals.iter().map(|t| t.id.clone()).collect())
+            .unwrap_or_default();
+        self.teardown_agent(&id, &tab_ids, cx);
         for project in &mut self.state.projects {
             project.agents.retain(|a| a.id != id);
         }
@@ -535,10 +859,33 @@ impl Workspace {
         cx.notify();
     }
 
+    fn active_terminal(&self, agent_id: &str) -> Option<&Entity<TerminalView>> {
+        let tab_id = self.active_tabs.get(agent_id).cloned().unwrap_or(agent_id.to_string());
+        self.terminals.get(&tab_id)
+    }
+
     fn select_agent(&mut self, id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = Some(id.clone());
         self.inline_edit = None;
-        if let Some(view) = self.terminals.get(&id) {
+        // Saved agents get their processes spawned the first time they are
+        // looked at, not all at once during startup.
+        self.restore_agent(&id, cx);
+        if let Some(view) = self.active_terminal(&id) {
+            let handle = view.focus_handle(cx);
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    fn select_tab(
+        &mut self,
+        agent_id: AgentId,
+        tab_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_tabs.insert(agent_id.clone(), tab_id);
+        if let Some(view) = self.active_terminal(&agent_id) {
             let handle = view.focus_handle(cx);
             window.focus(&handle);
         }
@@ -628,14 +975,13 @@ impl Workspace {
                     .p_2()
                     .text_color(theme::fg_dim())
                     .text_sm()
-                    .child("No projects yet. Use + Add below to pick a git repository."),
+                    .child("No projects yet — pick a git repository below."),
             );
         }
 
         for (project_index, project) in self.state.projects.iter().enumerate() {
             let expanded = project.expanded;
             let project_path = project.path.clone();
-            let path_label: SharedString = project.path.to_string_lossy().into_owned().into();
 
             list = list.child(
                 div()
@@ -672,13 +1018,6 @@ impl Workspace {
                                     .text_sm()
                                     .whitespace_nowrap()
                                     .child(SharedString::from(project.name.clone())),
-                            )
-                            .child(
-                                div()
-                                    .text_color(theme::fg_dim())
-                                    .text_xs()
-                                    .whitespace_nowrap()
-                                    .child(path_label),
                             ),
                     )
                     .child(
@@ -779,23 +1118,16 @@ impl Workspace {
                                     .flex_1()
                                     .min_w_0()
                                     .overflow_hidden()
+                                    // Name only: the branch used to be shown
+                                    // on a second line, which doubled the row
+                                    // height for information the agent name
+                                    // already implies.
                                     .child(
                                         div()
                                             .text_color(theme::fg())
                                             .text_sm()
                                             .whitespace_nowrap()
                                             .child(SharedString::from(agent.name.clone())),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_color(theme::fg_dim())
-                                            .text_xs()
-                                            .whitespace_nowrap()
-                                            .child(SharedString::from(
-                                                agent.branch.clone().unwrap_or_else(|| {
-                                                    "base checkout".to_string()
-                                                }),
-                                            )),
                                     ),
                             )
                             .child(
@@ -804,7 +1136,6 @@ impl Workspace {
                                     .px_1()
                                     .rounded_sm()
                                     .text_color(theme::fg_dim())
-                                    .text_xs()
                                     .hover(|s| {
                                         s.bg(theme::selected_bg()).text_color(theme::accent())
                                     })
@@ -812,7 +1143,12 @@ impl Workspace {
                                         cx.stop_propagation();
                                         this.start_inline_edit(edit_id.clone(), window, cx);
                                     }))
-                                    .child("edit"),
+                                    .child(
+                                        svg()
+                                            .path("icons/pencil.svg")
+                                            .size_3()
+                                            .text_color(theme::fg_dim()),
+                                    ),
                             )
                             .child(
                                 div()
@@ -833,6 +1169,41 @@ impl Workspace {
                 }
             }
         }
+
+        // Adding a project is part of the list rather than a separate button:
+        // the row lines up with the project headers, with a `+` where their
+        // expand/collapse triangle goes.
+        list = list.child(
+            div()
+                .id("new-project")
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::hover_bg()))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.add_project_via_picker(cx);
+                }))
+                .child(
+                    div()
+                        .text_color(theme::accent())
+                        .text_sm()
+                        .w_4()
+                        .child("+"),
+                )
+                .child(
+                    div().flex_1().overflow_hidden().child(
+                        div()
+                            .text_color(theme::fg_dim())
+                            .text_sm()
+                            .whitespace_nowrap()
+                            .child("New project"),
+                    ),
+                ),
+        );
 
         div()
             .flex()
@@ -877,21 +1248,6 @@ impl Workspace {
                                     }))
                                     .child("◂"),
                             )
-                            .child(
-                                div()
-                                    .id("add-project")
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_sm()
-                                    .text_color(theme::accent())
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme::hover_bg()))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.add_project_via_picker(cx);
-                                    }))
-                                    .child("+ Add"),
-                            ),
                     )
                     .child(
                         div()
@@ -902,13 +1258,146 @@ impl Workspace {
                             .text_color(theme::fg_dim())
                             .cursor_pointer()
                             .hover(|s| s.bg(theme::hover_bg()).text_color(theme::fg()))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.open_settings_dialog(cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_settings_dialog(window, cx);
                             }))
                             .child("⚙"),
                     ),
             )
             .into_any_element()
+    }
+
+    fn render_tabs(
+        &self,
+        agent: &AgentRecord,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let active_id = self
+            .active_tabs
+            .get(&agent.id)
+            .cloned()
+            .unwrap_or_else(|| agent.id.clone());
+
+        let tab =
+            |id: &str,
+             label: String,
+             active: bool,
+             closable: bool,
+             agent_id: AgentId,
+             on_click: Box<dyn Fn(&mut Self, &ClickEvent, &mut Window, &mut Context<Self>) + 'static>,
+             cx: &Context<Self>| {
+                let tab_id: SharedString = format!("tab-{id}").into();
+                let tab_id_for_close = id.to_string();
+                let owner_id = agent_id.clone();
+                let mut tab = div()
+                    .id(tab_id)
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .cursor_pointer()
+                    .border_r_1()
+                    .border_color(theme::border())
+                    .text_color(if active {
+                        theme::accent()
+                    } else {
+                        theme::fg()
+                    })
+                    .hover(|s| s.bg(theme::hover_bg()))
+                    .on_click(cx.listener(on_click))
+                    .child(
+                        div()
+                            .max_w(px(140.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_sm()
+                            .child(SharedString::from(label)),
+                    );
+
+                if closable {
+                    tab = tab.child(
+                        div()
+                            .id(format!("close-{tab_id_for_close}"))
+                            .ml_1()
+                            .text_color(theme::fg_dim())
+                            .hover(|s| s.text_color(theme::error()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.remove_terminal_tab(owner_id.clone(), tab_id_for_close.clone(), cx);
+                            }))
+                            .child("×"),
+                    );
+                }
+
+                tab.into_any_element()
+            };
+
+        let mut row = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .border_b_1()
+            .border_color(theme::border());
+
+        // Agent tab (always first).
+        let agent_id = agent.id.clone();
+        row = row.child(tab(
+            &agent.id,
+            "Agent".to_string(),
+            active_id == agent.id,
+            false,
+            agent.id.clone(),
+            Box::new(move |this, _: &ClickEvent, window, cx| {
+                this.select_tab(agent_id.clone(), agent_id.clone(), window, cx);
+            }),
+            cx,
+        ));
+
+        // Extra terminal tabs.
+        for tab_record in &agent.terminals {
+            let tab_id = tab_record.id.clone();
+            let owner_id = agent.id.clone();
+            row = row.child(tab(
+                &tab_record.id,
+                tab_record.name.clone(),
+                active_id == tab_record.id,
+                true,
+                agent.id.clone(),
+                Box::new(move |this, _: &ClickEvent, window, cx| {
+                    this.select_tab(owner_id.clone(), tab_id.clone(), window, cx);
+                }),
+                cx,
+            ));
+        }
+
+        // Add new terminal tab.
+        let add_agent_id = agent.id.clone();
+        row = row.child(
+            div()
+                .id("add-terminal-tab")
+                .px_2()
+                .py_1()
+                .cursor_pointer()
+                .text_color(theme::accent())
+                .hover(|s| s.bg(theme::hover_bg()))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let next = this
+                        .state
+                        .agent(&add_agent_id)
+                        .map(|r| r.terminals.len() + 1)
+                        .unwrap_or(1);
+                    this.add_terminal_tab(
+                        add_agent_id.clone(),
+                        format!("Shell {next}"),
+                        window,
+                        cx,
+                    );
+                }))
+                .child("+"),
+        );
+
+        row.into_any_element()
     }
 
     fn render_main_pane(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -939,42 +1428,68 @@ impl Workspace {
             }
             Some(agent) => {
                 let id = agent.id.clone();
-                match self.terminals.get(&id) {
-                    Some(view) => {
-                        pane = pane.child(div().flex_1().overflow_hidden().child(view.clone()));
-                    }
-                    None => {
-                        let resume_id = id.clone();
-                        pane = pane.child(
+                let resume_id = id.clone();
+                pane = pane
+                    .child(self.render_tabs(&agent, cx))
+                    .child(div().h_px().bg(theme::border()));
+                let active_tab_id = self
+                    .active_tabs
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| id.clone());
+                if let Some(outgoing) = self.outgoing_terminals.get(&active_tab_id) {
+                    // A resume is in progress: show the superseded terminal's
+                    // last screen. The live terminal is still laid out (so it
+                    // gets a size) but invisible until its first output
+                    // removes this entry.
+                    let mut stack = div()
+                        .flex_1()
+                        .overflow_hidden()
+                        .relative()
+                        .child(outgoing.clone());
+                    if let Some(view) = self.active_terminal(&id) {
+                        stack = stack.child(
                             div()
-                                .flex()
-                                .flex_1()
-                                .flex_col()
-                                .items_center()
-                                .justify_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_color(theme::fg_dim())
-                                        .child("No live session for this agent."),
-                                )
-                                .child(
-                                    div()
-                                        .id("resume-agent")
-                                        .px_3()
-                                        .py_1()
-                                        .rounded_sm()
-                                        .bg(theme::selected_bg())
-                                        .text_color(theme::accent())
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(theme::hover_bg()))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.resume_agent(resume_id.clone(), cx);
-                                        }))
-                                        .child("Resume session (claude --continue)"),
-                                ),
+                                .absolute()
+                                .inset_0()
+                                .overflow_hidden()
+                                .invisible()
+                                .child(view.clone()),
                         );
                     }
+                    pane = pane.child(stack);
+                } else if let Some(view) = self.active_terminal(&id) {
+                    pane = pane.child(div().flex_1().overflow_hidden().child(view.clone()));
+                } else {
+                    pane = pane.child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(theme::fg_dim())
+                                    .child("No live session for this agent."),
+                            )
+                            .child(
+                                div()
+                                    .id("resume-agent")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(theme::selected_bg())
+                                    .text_color(theme::accent())
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::hover_bg()))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.resume_agent(resume_id.clone(), cx);
+                                    }))
+                                    .child("Resume session (claude --continue)"),
+                            ),
+                    );
                 }
             }
         }
@@ -1013,11 +1528,10 @@ impl Workspace {
                     .text_color(theme::fg_dim())
                     .cursor_pointer()
                     .hover(|s| s.bg(theme::hover_bg()))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.dialog = None;
-                        cx.notify();
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close_dialog(window, cx);
                     }))
-                    .child("Cancel (esc)"),
+                    .child("Cancel"),
             )
             .child(
                 div()
@@ -1213,7 +1727,11 @@ impl Workspace {
                 .into_any_element()
             }
 
-            Dialog::Settings { preset_inputs, .. } => {
+            Dialog::Settings {
+                focus_handle,
+                preset_inputs,
+                ..
+            } => {
                 let mut preset_list = div().flex().flex_col().gap_2();
                 for (index, inputs) in preset_inputs.iter().enumerate() {
                     let label = |text: &'static str| {
@@ -1281,6 +1799,10 @@ impl Workspace {
                 // Title and buttons stay fixed; everything in between
                 // scrolls, so the dialog never outgrows the window.
                 div()
+                    // Focus target of last resort: with no preset rows there
+                    // is no input to hold the keyboard, and it would fall
+                    // back to the terminal behind the dialog.
+                    .track_focus(focus_handle)
                     .flex()
                     .flex_col()
                     .gap_2()
@@ -1327,8 +1849,8 @@ impl Workspace {
                                     .text_sm()
                                     .cursor_pointer()
                                     .hover(|s| s.bg(theme::hover_bg()))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.add_preset_row(cx);
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_preset_row(window, cx);
                                     }))
                                     .child("+ Add preset"),
                             ),
@@ -1347,6 +1869,23 @@ impl Workspace {
                 .justify_center()
                 .p_8()
                 .bg(gpui::hsla(0., 0., 0., 0.5))
+                // A modal has to swallow the mouse: without this the backdrop
+                // has no hitbox, so clicks and drags fall straight through to
+                // the terminal underneath, which then starts a selection or
+                // forwards the drag to the program behind the dialog.
+                .occlude()
+                // Escape belongs to the dialog as a whole, not just to its
+                // text fields: the `escape` key binding is scoped to the
+                // TextInput context, so it stops working the moment focus
+                // moves to a button, a chip or the panel itself. This sits on
+                // an ancestor of everything in the dialog, so it sees the key
+                // whatever inside has focus.
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.close_dialog(window, cx);
+                        cx.stop_propagation();
+                    }
+                }))
                 .child(panel)
                 .into_any_element(),
         )
@@ -1367,10 +1906,23 @@ impl Workspace {
                     }
                 }
             }
-            Some(Dialog::Settings { .. }) => self.save_settings(cx),
+            Some(Dialog::Settings { .. }) => self.save_settings(window, cx),
             None => {}
         }
     }
+}
+
+/// Split a shell-style `KEY=value` word, as accepted at the front of a
+/// configured agent command. Only names that look like environment variables
+/// qualify, so a program path containing `=` isn't mistaken for one.
+fn split_assignment(word: &str) -> Option<(String, String)> {
+    let (name, value) = word.split_once('=')?;
+    let valid = !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    valid.then(|| (name.to_string(), value.to_string()))
 }
 
 fn shellexpand_home(path: &str) -> String {

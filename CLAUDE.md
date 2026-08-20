@@ -7,6 +7,13 @@
 - `cargo test` covers the planner and worktree lifecycle. For visual/UI
   verification use the `headless-gui-testing` skill
   (`.claude/skills/headless-gui-testing/SKILL.md`).
+- When a test needs the real `claude` CLI running inside a terminal (e.g.
+  reproducing TUI rendering or selection behaviour), **always pin a cheap
+  model**: `claude --model haiku`. The same goes for the planner, which
+  already defaults to haiku (`HARMONIUM_PLANNER_MODEL`). Never drive tests
+  with the default premium model.
+- `HARMONIUM_AGENT_BIN` replaces the agent command entirely, which is the
+  easiest way to put a scripted or cheap stand-in in the agent tab.
 
 ## Sandbox: sudo may be impossible — stop and ask
 

@@ -128,8 +128,14 @@ fn open_prs(repo: &Path) -> Option<String> {
 /// Ask the LLM to derive a plan from the task description. Uses the `claude`
 /// CLI in non-interactive print mode on a cheap model — planning is a small
 /// classification task, and a full-priced model would spend ~50x more on the
-/// same fixed session overhead. Override the whole command line (the prompt
-/// is appended as the final argument) with `HARMONIUM_PLANNER_CMD`.
+/// same fixed session overhead.
+///
+/// Configure via:
+/// - `HARMONIUM_PLANNER_CMD`: override the whole command line (the prompt is
+///   appended as the final argument).
+/// - `HARMONIUM_PLANNER_MODEL`: set just the `--model` argument, e.g.
+///   `sonnet` or `haiku`. Defaults to `haiku`.
+/// Setting both variables is an error.
 pub fn plan_task(repo: &Path, task: &str) -> Result<TaskPlan> {
     let locals = local_branches(repo);
     let remotes = remote_branches(repo);
@@ -177,8 +183,33 @@ about an existing pull request, it MUST have the form "#<PR number> <2-4 word su
         prs = prs.unwrap_or_else(|| "(none or unavailable)".into()),
     );
 
-    let command = std::env::var("HARMONIUM_PLANNER_CMD")
-        .unwrap_or_else(|_| "claude -p --model haiku".to_string());
+    // An exported-but-empty override counts as unset: otherwise an empty
+    // _MODEL turns into a bare `--model` that swallows the prompt, and an
+    // empty _CMD would trip the mutual-exclusion check against a real _MODEL.
+    let override_var = |name: &str| -> Option<String> {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let cmd_override = override_var("HARMONIUM_PLANNER_CMD");
+    let model_override = override_var("HARMONIUM_PLANNER_MODEL");
+    if cmd_override.is_some() && model_override.is_some() {
+        bail!(
+            "only one of HARMONIUM_PLANNER_CMD and HARMONIUM_PLANNER_MODEL may be set"
+        );
+    }
+    let command = match cmd_override {
+        Some(command) => command,
+        None => {
+            let model = model_override.unwrap_or_else(|| "haiku".to_string());
+            // A multi-word model name would inject extra CLI flags.
+            if model.chars().any(char::is_whitespace) {
+                bail!("HARMONIUM_PLANNER_MODEL must be a single word, got `{model}`");
+            }
+            format!("claude -p --model {model}")
+        }
+    };
     let mut parts = split_command(&command);
     if parts.is_empty() {
         bail!("empty planner command");

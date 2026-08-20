@@ -5,6 +5,28 @@ edition = "2021"
 description = "A GPUI-based agent orchestrator: projects, agents, and embedded terminals"
 license = "MIT"
 
+[package.metadata.deb]
+maintainer = "Till Ehrengruber <tehrengruber@users.noreply.github.com>"
+copyright = "Harmonium contributors"
+section = "devel"
+priority = "optional"
+# `$auto` resolves the libraries the binary links against (xcb, xkbcommon,
+# glibc); wayland and vulkan are dlopened at runtime and have to be named.
+depends = "$auto, libwayland-client0, libvulkan1, git"
+recommends = "fonts-dejavu-core, mesa-vulkan-drivers"
+# Not packaged by Ubuntu; installed from their own repositories.
+suggests = "gh, claude-code"
+extended-description = """\
+Harmonium is a terminal emulator with orchestration UI on top: manage git \
+projects, spawn coding agents into per-branch worktrees derived from a \
+plain-language task description, and drive each agent through an embedded \
+PTY terminal."""
+assets = [
+    ["target/release/harmonium", "usr/bin/", "755"],
+    ["packaging/harmonium.desktop", "usr/share/applications/harmonium.desktop", "644"],
+    ["README.md", "usr/share/doc/harmonium/README.md", "644"],
+]
+
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", tag = "v0.217.5" }
 alacritty_terminal = "0.25"
@@ -15,6 +37,7 @@ futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 env_logger = "0.11"
 unicode-segmentation = "1"
+shlex = "1"
 
 [profile.dev]
 debug = "line-tables-only"

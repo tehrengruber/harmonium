@@ -22,6 +22,18 @@ pub struct AgentRecord {
     /// Command line used to resume this agent's session.
     #[serde(default)]
     pub resume_command: Option<String>,
+    /// Extra terminal tabs opened next to the agent tab. Persisted so the
+    /// same tabs reappear after a restart; each restarts as a fresh shell
+    /// in the agent's workdir.
+    #[serde(default)]
+    pub terminals: Vec<TerminalTabRecord>,
+}
+
+/// A plain shell terminal tab attached to an agent.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TerminalTabRecord {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -147,6 +159,16 @@ pub fn data_dir() -> PathBuf {
         return Path::new(&home).join(".local/share/harmonium");
     }
     PathBuf::from(".harmonium")
+}
+
+/// Directory where per-terminal scrollback history files are stored.
+pub fn history_dir() -> PathBuf {
+    data_dir().join("history")
+}
+
+/// File path for a terminal tab's saved scrollback history.
+pub fn terminal_history_path(terminal_id: &str) -> PathBuf {
+    history_dir().join(format!("{terminal_id}.txt"))
 }
 
 fn state_file() -> PathBuf {

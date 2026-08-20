@@ -21,7 +21,12 @@ fn main() {
     if args.len() >= 4 && args[1] == "plan" {
         let repo = std::path::PathBuf::from(&args[2]);
         let task = args[3..].join(" ");
-        match planner::plan_task(&repo, &task) {
+        let settings = state::load_state().settings;
+        let planner_settings = planner::PlannerSettings {
+            command: settings.planner_command,
+            model: settings.planner_model,
+        };
+        match planner::plan_task(&repo, &task, &planner_settings) {
             Ok(plan) => println!("{plan:#?}"),
             Err(error) => {
                 eprintln!("planner failed ({error}), fallback:");

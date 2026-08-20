@@ -107,6 +107,13 @@ pub struct SettingsRecord {
     /// spawn dialog).
     pub last_preset: usize,
     pub theme: crate::theme::ThemeMode,
+    /// Full planner command line; when set it replaces the default
+    /// `claude -p --model <planner_model>` and the model is unused.
+    pub planner_command: String,
+    /// Model for the default planner command.
+    pub planner_model: String,
+    pub terminal_font: String,
+    pub ui_font: String,
 }
 
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 280.;
@@ -120,6 +127,10 @@ impl Default for SettingsRecord {
             presets: default_presets(),
             last_preset: 0,
             theme: crate::theme::ThemeMode::default(),
+            planner_command: String::new(),
+            planner_model: crate::planner::DEFAULT_MODEL.to_string(),
+            terminal_font: crate::theme::DEFAULT_TERMINAL_FONT.to_string(),
+            ui_font: crate::theme::DEFAULT_UI_FONT.to_string(),
         }
     }
 }

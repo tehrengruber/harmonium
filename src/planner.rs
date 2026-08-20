@@ -125,18 +125,35 @@ fn open_prs(repo: &Path) -> Option<String> {
     (!s.is_empty() && s != "[]").then_some(s)
 }
 
-/// Ask the LLM to derive a plan from the task description. Uses the `claude`
-/// CLI in non-interactive print mode on a cheap model — planning is a small
-/// classification task, and a full-priced model would spend ~50x more on the
-/// same fixed session overhead.
+/// Model used by the default planner command. Planning is a tiny
+/// classification job, so a small model is the sane default: a `claude -p`
+/// call carries a fixed session overhead that a full-priced model would spend
+/// ~50x more on.
+pub const DEFAULT_MODEL: &str = "haiku";
+
+/// Planner configuration from the persisted settings, as edited in the
+/// settings dialog. The `HARMONIUM_PLANNER_*` variables still override these
+/// for one-off runs.
+#[derive(Clone, Debug, Default)]
+pub struct PlannerSettings {
+    /// Full command line; when set, `model` is unused.
+    pub command: String,
+    /// Model for the default `claude -p --model <model>` command.
+    pub model: String,
+}
+
+/// Ask the LLM to derive a plan from the task description, using the `claude`
+/// CLI in non-interactive print mode. The prompt is appended to the resolved
+/// command as its final argument.
 ///
-/// Configure via:
-/// - `HARMONIUM_PLANNER_CMD`: override the whole command line (the prompt is
-///   appended as the final argument).
-/// - `HARMONIUM_PLANNER_MODEL`: set just the `--model` argument, e.g.
-///   `sonnet` or `haiku`. Defaults to `haiku`.
-/// Setting both variables is an error.
-pub fn plan_task(repo: &Path, task: &str) -> Result<TaskPlan> {
+/// The command is resolved in this order, highest first:
+///
+/// 1. `HARMONIUM_PLANNER_CMD` — the whole command line.
+/// 2. `HARMONIUM_PLANNER_MODEL` — just the `--model` argument. Setting both
+///    variables is an error.
+/// 3. `settings.command`, the planner command from the settings dialog.
+/// 4. `settings.model`, falling back to [`DEFAULT_MODEL`].
+pub fn plan_task(repo: &Path, task: &str, settings: &PlannerSettings) -> Result<TaskPlan> {
     let locals = local_branches(repo);
     let remotes = remote_branches(repo);
     let default = default_branch(repo);
@@ -199,16 +216,22 @@ about an existing pull request, it MUST have the form "#<PR number> <2-4 word su
             "only one of HARMONIUM_PLANNER_CMD and HARMONIUM_PLANNER_MODEL may be set"
         );
     }
-    let command = match cmd_override {
-        Some(command) => command,
-        None => {
-            let model = model_override.unwrap_or_else(|| "haiku".to_string());
-            // A multi-word model name would inject extra CLI flags.
-            if model.chars().any(char::is_whitespace) {
-                bail!("HARMONIUM_PLANNER_MODEL must be a single word, got `{model}`");
-            }
-            format!("claude -p --model {model}")
-        }
+    let non_empty = |value: &str| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    };
+    // Env first (one-off overrides), then the settings, then the default. A
+    // configured command wins over a configured model, which is what the
+    // settings dialog says it does.
+    let command = match (cmd_override, model_override) {
+        (Some(command), _) => command,
+        (None, Some(model)) => planner_command_for(&model)?,
+        (None, None) => match non_empty(&settings.command) {
+            Some(command) => command,
+            None => planner_command_for(
+                &non_empty(&settings.model).unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+            )?,
+        },
     };
     let mut parts = split_command(&command);
     if parts.is_empty() {
@@ -229,6 +252,15 @@ about an existing pull request, it MUST have the form "#<PR number> <2-4 word su
     }
     let text = String::from_utf8_lossy(&out.stdout);
     parse_plan_json(&text)
+}
+
+/// The default planner command for a model name. A multi-word name would
+/// inject extra CLI flags, so it is rejected.
+fn planner_command_for(model: &str) -> Result<String> {
+    if model.chars().any(char::is_whitespace) {
+        bail!("planner model must be a single word, got `{model}`");
+    }
+    Ok(format!("claude -p --model {model}"))
 }
 
 /// First ~200 chars of a message, for error reporting.

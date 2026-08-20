@@ -4,6 +4,7 @@
 use gpui::{px, rgb, App, Font, FontFeatures, FontStyle, FontWeight, Global, Hsla, Pixels, SharedString};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::RwLock;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -17,6 +18,54 @@ pub enum ThemeMode {
 // (called from ~100 sites, including element paint code) keep their no-arg
 // signatures.
 static DARK: AtomicBool = AtomicBool::new(false);
+
+pub const DEFAULT_UI_FONT: &str = "DejaVu Sans";
+pub const DEFAULT_TERMINAL_FONT: &str = "DejaVu Sans Mono";
+
+/// Font families from the persisted settings. Same reasoning as `DARK`: the
+/// font accessors are called from paint code that has no settings handle.
+static FONTS: RwLock<Fonts> = RwLock::new(Fonts {
+    ui: None,
+    terminal: None,
+});
+
+struct Fonts {
+    ui: Option<String>,
+    terminal: Option<String>,
+}
+
+/// Apply the configured font families. Empty values fall back to the
+/// defaults; the `HARMONIUM_*_FONT` variables still override both.
+pub fn set_fonts(ui: &str, terminal: &str) {
+    let clean = |value: &str| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    };
+    if let Ok(mut fonts) = FONTS.write() {
+        fonts.ui = clean(ui);
+        fonts.terminal = clean(terminal);
+    }
+}
+
+/// Env var, then the persisted setting, then the built-in default.
+fn font_family(var: &str, configured: Option<String>, default: &str) -> SharedString {
+    let from_env = std::env::var(var).ok().filter(|v| !v.trim().is_empty());
+    SharedString::from(
+        from_env
+            .or(configured)
+            .unwrap_or_else(|| default.to_string()),
+    )
+}
+
+fn font(family: SharedString) -> Font {
+    Font {
+        family,
+        features: FontFeatures::default(),
+        weight: FontWeight::NORMAL,
+        style: FontStyle::Normal,
+        fallbacks: None,
+    }
+}
 
 pub fn set_mode(mode: ThemeMode) {
     DARK.store(mode == ThemeMode::Dark, Ordering::Relaxed);
@@ -109,26 +158,16 @@ pub fn warn() -> Hsla {
 }
 
 pub fn ui_font() -> Font {
-    Font {
-        family: SharedString::from(
-            std::env::var("HARMONIUM_UI_FONT").unwrap_or_else(|_| "DejaVu Sans".into()),
-        ),
-        features: FontFeatures::default(),
-        weight: FontWeight::NORMAL,
-        style: FontStyle::Normal,
-        fallbacks: None,
-    }
+    let configured = FONTS.read().ok().and_then(|fonts| fonts.ui.clone());
+    font(font_family("HARMONIUM_UI_FONT", configured, DEFAULT_UI_FONT))
 }
 
 pub fn terminal_font() -> Font {
-    Font {
-        family: SharedString::from(
-            std::env::var("HARMONIUM_TERMINAL_FONT").unwrap_or_else(|_| "DejaVu Sans Mono".into()),
-        ),
-        features: FontFeatures::default(),
-        weight: FontWeight::NORMAL,
-        style: FontStyle::Normal,
-        fallbacks: None,
-    }
+    let configured = FONTS.read().ok().and_then(|fonts| fonts.terminal.clone());
+    font(font_family(
+        "HARMONIUM_TERMINAL_FONT",
+        configured,
+        DEFAULT_TERMINAL_FONT,
+    ))
 }
 

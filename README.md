@@ -12,87 +12,60 @@ and interact with each agent through an embedded terminal.
 
 ## How it works
 
-- **Left sidebar** — list of projects; each project expands to its agents.
-  A project is simply a path to a directory containing a git repository.
-  The agent name is LLM-generated from the task — for work on an existing
-  PR it has the form `#<PR number> <short description>` (open PRs are fed
-  to the planner via `gh pr list` when available) — and can be edited
-  inline via the row's pencil button or by double-clicking the row.
-  Projects are added via the *New project* row at the end of the list,
-  which opens the system directory picker. The sidebar is collapsible
-  (the `◂`/`▸` buttons in the bottom bar, next to the settings gear) and
-  its width can be adjusted by dragging the divider; both persist.
-- **Right pane** — the selected agent as a tab view. The first tab
-  (*Agent*) is the agent session itself (a real PTY running claude-code);
-  the `+` button opens additional plain shell tabs in the agent's workdir.
-  Shell tabs persist: on restart the same tabs come back as fresh shells
-  with their previous scrollback (colors included) replayed above the new
-  prompt, so earlier output stays scrollable and selectable.
-- **Settings** — the gear button in the sidebar's bottom bar opens the
-  settings dialog: base font size (UI and terminal scale together), the
-  theme (light by default, dark available — covers the UI and the
-  terminal's ANSI palette), and
-  **agent presets**. A preset is a named command pair — the spawn command
-  (task text appended as the last argument) and the resume command. Three
-  defaults ship: plain `claude`, and two sandboxed variants via
-  [claude-container-isolation](https://github.com/tehrengruber/claude-container-isolation)
-  (`claude-isol --local` for bubblewrap, `claude-isol` for a podman
-  container). Presets are freely editable/addable/removable; everything is
-  persisted.
-- **Spawning an agent** (`+` next to a project) opens a dialog where you
-  describe the task and pick a preset (the last-used one is preselected).
-  An LLM (the `claude` CLI in print mode) derives from the task and the
-  repo's branch list:
-  - `existing_branch` — the task refers to an existing branch/PR: that branch
-    is checked out in a worktree (reused if one already exists — git allows
-    only one worktree per branch, which harmonium respects);
-  - `new_branch` — a fresh kebab-case branch off a base branch (default:
-    the repo's default branch);
-  - `base` — work directly on the project's base checkout, no worktree.
+Projects are git repositories. Spawning an agent asks an LLM to turn the task
+description into a workspace — an existing branch or PR checked out in a
+worktree, a fresh kebab-case branch off the default branch, or the project's
+base checkout — and to name the agent (`#<PR number> <summary>` for PR work,
+open PRs come from `gh pr list` when available). The preset's command then
+runs there in an embedded PTY with the task appended as its last argument. A
+preset is a named pair of spawn and resume command lines; the defaults cover
+plain `claude` plus the sandboxed
+[claude-isol](https://github.com/tehrengruber/claude-container-isolation)
+variants. If planning fails, the error is shown in the dialog and no agent or
+branch is created.
 
-  Then the preset's command is spawned with the task appended, in the
-  resulting directory inside the embedded terminal. The agent records the
-  preset's spawn and resume commands, so later restarts/resumes use the
-  same setup. If the planner fails (e.g. usage/session limit reached, CLI
-  missing), the error — including the planner's reply — is shown in the
-  dialog and no agent or branch is created; the task text is kept so you
-  can retry.
+Each agent has its own agent terminal plus any number of shell tabs in the
+same workdir. Shell scrollback is written to disk on exit and replayed above
+the new prompt on the next start, colors included. Terminals are restored
+lazily — nothing spawns until an agent is selected, and its session then
+restarts with the preset's resume command; a *Resume session* button restarts
+it if it exits.
 
-Worktrees live under `~/.local/share/harmonium/worktrees/<repo>-<hash>/<branch>`;
-projects/agents persist in `~/.local/share/harmonium/state.json`. After
-restarting harmonium, an agent's terminals are restored lazily the first
-time it is selected: the agent session restarts with its preset's resume
-command in its workdir, and its shell tabs respawn with their saved
-scrollback. If a session exits or fails to spawn, a *Resume session*
-button restarts it.
+Worktrees live under `~/.local/share/harmonium/worktrees/<repo>-<hash>/<branch>`
+and state in `~/.local/share/harmonium/state.json`.
 
 ## Keyboard & mouse
 
-- Terminal: full keyboard passthrough (arrows, ctrl-keys, function keys,
-  alt-chords), mouse wheel scrollback, and mouse selection — drag to select,
-  double-click for a word, triple-click for a line; `ctrl-shift-c` copies the
-  selection, `ctrl-shift-v` pastes. Typing or pasting clears the selection.
-- Text inputs (dialogs, name editing): full editing — mouse selection and
-  click-to-position, arrow keys, shift-arrow selection, home/end, `ctrl-a`
-  select all, `ctrl-c`/`ctrl-v`/`ctrl-x` clipboard, IME composition;
-  `enter` submits, `escape` cancels. The task description input is
-  multi-line (wraps and grows): `enter` inserts a newline, `up`/`down` move
-  between lines, and `ctrl-enter` spawns.
+Only the parts that aren't obvious from the UI:
+
+- `ctrl-shift-c` / `ctrl-shift-v` copy and paste in a terminal — plain
+  `ctrl-c`/`ctrl-v` belong to the program. A copy includes the selected
+  parts that are scrolled out of view.
+- Dragging past the top or bottom edge auto-scrolls and keeps extending the
+  selection, which is how a selection grows beyond one screenful.
+- Programs that request mouse tracking (full-screen TUIs like the agent) get
+  presses, drags and wheel events and run their own selection and scrolling.
+  **Hold shift** to take the mouse back for a terminal-side selection, or to
+  keep the wheel on the terminal's scrollback — the xterm/VTE convention. On
+  the alternate screen the wheel is otherwise translated to arrow keys, so
+  pagers scroll as expected.
+- In the task dialog `enter` inserts a newline and `ctrl-enter` spawns.
 - `ctrl-q` quits.
 
-## Configuration (environment variables)
+## Configuration
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `HARMONIUM_AGENT_BIN` | – | Overrides the preset command entirely (testing) |
-| `HARMONIUM_PLANNER_CMD` | `claude -p --model haiku` | Planner command line; the planning prompt is appended as the last argument. Haiku is the default because planning is a tiny classification task — a `claude -p` call boots a full Claude Code session (~15–19K tokens of scaffolding), which costs ~$0.14 on a premium model but ~$0.003 on haiku with a warm prompt cache. |
-| `HARMONIUM_PLANNER_MODEL` | `haiku` | Sets just the planner's `--model`, keeping the default `claude -p` command. Mutually exclusive with `HARMONIUM_PLANNER_CMD` — setting both is an error. |
-| `HARMONIUM_DATA_DIR` | `~/.local/share/harmonium` | State + worktrees |
-| `HARMONIUM_TERMINAL_FONT` | `DejaVu Sans Mono` | Terminal font family |
-| `HARMONIUM_UI_FONT` | `DejaVu Sans` | UI font family |
+Everything else is in the settings dialog and persisted in `state.json`. The
+environment variables below still work and **override the persisted setting
+for that run**, which is handy for one-off experiments.
 
-Base font size defaults to 12 px and is adjustable in the settings panel
-(stored in `state.json`).
+| Variable | Setting | Default | Purpose |
+| --- | --- | --- | --- |
+| `HARMONIUM_PLANNER_CMD` | Planner ▸ Command | `claude -p --model haiku` | Planner command line; the planning prompt is appended as the last argument. Haiku is the default because planning is a tiny classification task — a `claude -p` call boots a full Claude Code session (~15–19K tokens of scaffolding), which costs ~$0.14 on a premium model but ~$0.003 on haiku with a warm prompt cache. |
+| `HARMONIUM_PLANNER_MODEL` | Planner ▸ Model | `haiku` | Sets just the planner's `--model`, keeping the default `claude -p` command. A planner command takes precedence: setting both env vars is an error, and in the dialog the model is marked unused while a command is set. |
+| `HARMONIUM_TERMINAL_FONT` | Fonts ▸ Terminal | `DejaVu Sans Mono` | Terminal font family. Applies immediately on save. |
+| `HARMONIUM_UI_FONT` | Fonts ▸ UI | `DejaVu Sans` | UI font family. Applies immediately on save. |
+| `HARMONIUM_DATA_DIR` | – | `~/.local/share/harmonium` | State + worktrees. Env-only: it decides where `state.json` itself lives. |
+| `HARMONIUM_AGENT_BIN` | – | – | Replaces the preset command entirely (testing). Env-only. |
 
 An agent preset command may start with shell-style `KEY=value` words, which
 become environment for that agent's process:
@@ -101,35 +74,13 @@ become environment for that agent's process:
 CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude
 ```
 
-`CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` is **optional**: the claude CLI
-normally runs on the *alternate screen*, where the transcript belongs to the
-program and it drives scrolling and selection through mouse reporting (which
-works out of the box, see below). Set the variable if you would rather have
-the agent render inline, so its output lands in the terminal's own
-scrollback and is scrolled and selected like any other output — at the cost
+That one is worth knowing about: the claude CLI normally runs on the
+*alternate screen*, where the transcript belongs to the program, which drives
+scrolling and selection through mouse reporting (works out of the box). Set
+the variable to have the agent render inline instead, so its output lands in
+the terminal's own scrollback and behaves like any other output — at the cost
 of claude's own scrollback UI. `CLAUDE_CODE_DISABLE_MOUSE=1` similarly hands
 the mouse back to the terminal.
-
-## Terminal scrolling & selection
-
-- Mouse wheel scrolls the scrollback. If the running program tracks the
-  mouse, the wheel is reported to it instead; on the alternate screen with
-  alternate-scroll enabled it is translated to arrow keys — the same
-  dispatch xterm and alacritty use, so pagers and TUIs scroll as expected.
-- Programs that ask for mouse tracking (`?1000`/`?1002`/`?1003`, SGR or the
-  legacy encoding) receive presses, drags and releases, so full-screen TUIs
-  like the agent run their own selection and scrolling over their own
-  scrollback. **Hold shift** to take the mouse back and select with the
-  terminal instead — the xterm/VTE convention. Shift also keeps the wheel on
-  the terminal's scrollback.
-- Click-drag selects; double/triple click select word/line. Dragging past
-  the top or bottom edge auto-scrolls and keeps extending the selection,
-  which is how a selection grows beyond one screenful.
-- `ctrl-shift-c` copies the selection, including the parts scrolled out of
-  view; `ctrl-shift-v` pastes.
-- The selection is owned by the terminal, not by the parser: a program that
-  erases and redraws its region (any Ink-style TUI does this several times a
-  second) cannot wipe a selection out from under the user.
 
 ## Building
 

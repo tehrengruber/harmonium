@@ -40,6 +40,10 @@ enum Dialog {
         /// Focus target for the panel itself, so the modal always owns the
         /// keyboard even when it has no input to focus (no presets yet).
         focus_handle: FocusHandle,
+        planner_command: Entity<TextInput>,
+        planner_model: Entity<TextInput>,
+        terminal_font: Entity<TextInput>,
+        ui_font: Entity<TextInput>,
         preset_inputs: Vec<PresetInputs>,
         _subscriptions: Vec<Subscription>,
     },
@@ -98,6 +102,7 @@ impl Workspace {
             base: state.settings.font_size,
         });
         theme::set_mode(state.settings.theme);
+        theme::set_fonts(&state.settings.ui_font, &state.settings.terminal_font);
         let workspace = Self {
             state,
             terminals: HashMap::new(),
@@ -349,6 +354,34 @@ impl Workspace {
 
     // ---- Settings ----
 
+    /// One text field in the settings dialog, wired to the same save/cancel
+    /// handling as the preset fields.
+    fn make_setting_input(
+        &mut self,
+        placeholder: &'static str,
+        value: &str,
+        subscriptions: &mut Vec<Subscription>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextInput> {
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new(placeholder, cx);
+            if !value.is_empty() {
+                input.set_text(value.to_string(), cx);
+            }
+            input
+        });
+        subscriptions.push(cx.subscribe_in(
+            &input,
+            window,
+            |this, _input, event: &InputEvent, window, cx| match event {
+                InputEvent::Submitted(_) => this.save_settings(window, cx),
+                InputEvent::Cancelled => this.close_dialog(window, cx),
+            },
+        ));
+        input
+    }
+
     fn make_preset_inputs(
         &mut self,
         name: &str,
@@ -405,6 +438,35 @@ impl Workspace {
         // the terminal keeps focus and typing goes into the PTY behind the
         // dialog. Prefer the first field; fall back to the panel itself when
         // there are no presets to focus.
+        let settings = self.state.settings.clone();
+        let planner_command = self.make_setting_input(
+            "Full command; leave empty to use the model below",
+            &settings.planner_command,
+            &mut subscriptions,
+            window,
+            cx,
+        );
+        let planner_model = self.make_setting_input(
+            planner::DEFAULT_MODEL,
+            &settings.planner_model,
+            &mut subscriptions,
+            window,
+            cx,
+        );
+        let terminal_font = self.make_setting_input(
+            theme::DEFAULT_TERMINAL_FONT,
+            &settings.terminal_font,
+            &mut subscriptions,
+            window,
+            cx,
+        );
+        let ui_font = self.make_setting_input(
+            theme::DEFAULT_UI_FONT,
+            &settings.ui_font,
+            &mut subscriptions,
+            window,
+            cx,
+        );
         let focus_handle = cx.focus_handle();
         match preset_inputs.first() {
             Some(first) => window.focus(&first.name.focus_handle(cx)),
@@ -412,6 +474,10 @@ impl Workspace {
         }
         self.dialog = Some(Dialog::Settings {
             focus_handle,
+            planner_command,
+            planner_model,
+            terminal_font,
+            ui_font,
             preset_inputs,
             _subscriptions: subscriptions,
         });
@@ -459,9 +525,22 @@ impl Workspace {
     }
 
     fn save_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Dialog::Settings { preset_inputs, .. }) = &self.dialog else {
+        let Some(Dialog::Settings {
+            planner_command,
+            planner_model,
+            terminal_font,
+            ui_font,
+            preset_inputs,
+            ..
+        }) = &self.dialog
+        else {
             return;
         };
+        let text = |input: &Entity<TextInput>| input.read(cx).text().trim().to_string();
+        let planner_command = text(planner_command);
+        let planner_model = text(planner_model);
+        let terminal_font = text(terminal_font);
+        let ui_font = text(ui_font);
         let presets: Vec<crate::state::PresetRecord> = preset_inputs
             .iter()
             .filter_map(|inputs| {
@@ -485,9 +564,27 @@ impl Workspace {
             .settings
             .last_preset
             .min(self.state.settings.presets.len().saturating_sub(1));
+        self.state.settings.planner_command = planner_command;
+        self.state.settings.planner_model = planner_model;
+        self.state.settings.terminal_font = terminal_font;
+        self.state.settings.ui_font = ui_font;
+        self.apply_fonts(cx);
         self.close_dialog(window, cx);
         self.persist(cx);
         cx.notify();
+    }
+
+    /// Push the configured font families into the theme and wake every
+    /// terminal so it re-measures its cell size, like a font-size change.
+    fn apply_fonts(&mut self, cx: &mut Context<Self>) {
+        theme::set_fonts(
+            &self.state.settings.ui_font,
+            &self.state.settings.terminal_font,
+        );
+        let views: Vec<_> = self.terminals.values().cloned().collect();
+        for view in views {
+            view.update(cx, |_, cx| cx.notify());
+        }
     }
 
     fn spawn_agent(
@@ -526,6 +623,10 @@ impl Workspace {
         cx.notify();
 
         let repo = project_path.clone();
+        let planner_settings = planner::PlannerSettings {
+            command: self.state.settings.planner_command.clone(),
+            model: self.state.settings.planner_model.clone(),
+        };
         cx.spawn_in(window, async move |this, cx| {
             let repo_for_bg = repo.clone();
             let task_for_bg = task.clone();
@@ -534,7 +635,7 @@ impl Workspace {
                 .spawn(async move {
                     // No fallback: if the planner fails (e.g. usage limit
                     // reached), report it instead of inventing a branch.
-                    let plan = planner::plan_task(&repo_for_bg, &task_for_bg)?;
+                    let plan = planner::plan_task(&repo_for_bg, &task_for_bg, &planner_settings)?;
                     planner::resolve_workspace(&repo_for_bg, &plan, &task_for_bg)
                 })
                 .await;
@@ -1729,9 +1830,35 @@ impl Workspace {
 
             Dialog::Settings {
                 focus_handle,
+                planner_command,
+                planner_model,
+                terminal_font,
+                ui_font,
                 preset_inputs,
                 ..
             } => {
+                let section = |text: &'static str| {
+                    div()
+                        .text_color(theme::fg())
+                        .text_sm()
+                        .mt_2()
+                        .child(text)
+                };
+                let field = |text: &'static str, input: Entity<TextInput>| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w_24()
+                                .flex_none()
+                                .text_color(theme::fg_dim())
+                                .text_xs()
+                                .child(text),
+                        )
+                        .child(div().flex_1().child(input))
+                };
                 let mut preset_list = div().flex().flex_col().gap_2();
                 for (index, inputs) in preset_inputs.iter().enumerate() {
                     let label = |text: &'static str| {
@@ -1825,6 +1952,30 @@ impl Workspace {
                             .gap_2()
                             .child(self.render_font_size_row(cx))
                             .child(self.render_theme_row(cx))
+                            .child(section("Fonts"))
+                            .child(field("Terminal", terminal_font.clone()))
+                            .child(field("UI", ui_font.clone()))
+                            .child(section("Planner"))
+                            .child(
+                                div()
+                                    .text_color(theme::fg_dim())
+                                    .text_xs()
+                                    .child("Derives the branch and agent name from the task description."),
+                            )
+                            .child(field("Command", planner_command.clone()))
+                            .child(field("Model", planner_model.clone()))
+                            .when(
+                                !planner_command.read(cx).text().trim().is_empty(),
+                                |panel| {
+                                    panel.child(
+                                        div()
+                                            .pl_24()
+                                            .text_color(theme::fg_dim())
+                                            .text_xs()
+                                            .child("The model is unused while a command is set."),
+                                    )
+                                },
+                            )
                             .child(
                                 div()
                                     .text_color(theme::fg())

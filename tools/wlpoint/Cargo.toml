@@ -1,0 +1,11 @@
+[package]
+name = "wlpoint"
+version = "0.1.0"
+edition = "2021"
+description = "Inject pointer events into a wlroots compositor (zwlr_virtual_pointer_v1). Used for headless UI testing."
+
+[workspace]
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }

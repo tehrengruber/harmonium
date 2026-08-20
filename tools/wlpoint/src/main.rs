@@ -18,6 +18,10 @@
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{wl_pointer, wl_registry, wl_seat};
 use wayland_client::{Connection, Dispatch, QueueHandle};
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
+    zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+    zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+};
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
     zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
@@ -73,22 +77,94 @@ impl Dispatch<ZwlrVirtualPointerV1, ()> for App {
     }
 }
 
+impl Dispatch<ZwpVirtualKeyboardManagerV1, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &ZwpVirtualKeyboardManagerV1,
+        _: <ZwpVirtualKeyboardManagerV1 as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpVirtualKeyboardV1, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &ZwpVirtualKeyboardV1,
+        _: <ZwpVirtualKeyboardV1 as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+fn evdev_code(name: &str) -> Option<u32> {
+    Some(match name {
+        "enter" => 28,
+        "escape" => 1,
+        "tab" => 15,
+        "space" => 57,
+        "up" => 103,
+        "down" => 108,
+        "left" => 105,
+        "right" => 106,
+        other => other.parse().ok()?,
+    })
+}
+
+/// Write bytes to an unlinked temp file and return the open handle.
+fn tempfile_with(bytes: &[u8]) -> Option<std::fs::File> {
+    use std::io::{Seek, Write};
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let path = std::path::Path::new(&dir).join(format!("wlpoint-keymap-{}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .ok()?;
+    let _ = std::fs::remove_file(&path);
+    file.write_all(bytes).ok()?;
+    file.rewind().ok()?;
+    Some(file)
+}
+
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
 
 struct Ctx {
     pointer: ZwlrVirtualPointerV1,
+    keyboard: Option<ZwpVirtualKeyboardV1>,
     extent: (u32, u32),
     time: u32,
 }
 
 impl Ctx {
     fn exec(&mut self, cmd: &str, args: &[&str]) {
-        let x: u32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let y: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         self.time += 20;
         let t = self.time;
+
+        // Keyboard commands skip the pointer motion entirely.
+        if cmd == "key" {
+            let (Some(keyboard), Some(code)) = (
+                self.keyboard.as_ref(),
+                args.first().and_then(|name| evdev_code(name)),
+            ) else {
+                eprintln!("wlpoint: key unavailable (no keymap or unknown key {args:?})");
+                return;
+            };
+            keyboard.key(t, code, 1);
+            keyboard.key(t + 10, code, 0);
+            return;
+        }
+
+        let x: u32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let y: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         self.pointer
             .motion_absolute(t, x, y, self.extent.0, self.extent.1);
         self.pointer.frame();
@@ -159,9 +235,24 @@ fn main() {
         .expect("bind zwlr_virtual_pointer_manager_v1 (compositor must support it)");
     let pointer = manager.create_virtual_pointer(Some(&seat), &qh, ());
 
+    // Optional virtual keyboard: needs an xkb keymap file, e.g. generated
+    // with `xkbcli compile-keymap --layout us > /tmp/keymap.xkb`.
+    let keyboard = std::env::var("WLPOINT_KEYMAP").ok().and_then(|path| {
+        let keymap = std::fs::read(&path).ok()?;
+        let kbd_manager: ZwpVirtualKeyboardManagerV1 = globals.bind(&qh, 1..=1, ()).ok()?;
+        let keyboard = kbd_manager.create_virtual_keyboard(&seat, &qh, ());
+        // The fd must stay valid until the compositor maps it; keep the
+        // file open for the program's lifetime via a leaked handle.
+        let file = Box::leak(Box::new(tempfile_with(&keymap)?));
+        use std::os::fd::AsFd;
+        keyboard.keymap(1, file.as_fd(), keymap.len() as u32); // 1 = XKB_V1
+        Some(keyboard)
+    });
+
     let mut app = App;
     let mut ctx = Ctx {
         pointer,
+        keyboard,
         extent,
         time: 0,
     };

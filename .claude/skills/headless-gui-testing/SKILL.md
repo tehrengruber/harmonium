@@ -8,6 +8,13 @@ description: How to build and visually test the GPUI app (or any Wayland/Vulkan 
 Verified working 2026-08-20 on the Arch-based AO worker container (no display
 server, passwordless sudo, `$HOME` mostly read-only).
 
+> ⚠️ **The container image varies between sessions.** A later session got an
+> image with NO usable sudo (`no new privileges` flag / broken `/etc/sudo.conf`)
+> and NO pacman database — but network, cargo, the claude CLI, DejaVu fonts,
+> and the workdir (with previously built binaries!) persisted. When sudo is
+> dead, use the **no-root package extraction** recipe below instead of pacman.
+> Check first: `sudo -n whoami; which sway cage grim wtype`.
+
 ## Environment quirks
 
 - `$HOME` is not writable → rustup fails. Install Rust via pacman instead, and
@@ -60,6 +67,48 @@ WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman \
 ```
 
 Xwayland/swaybg errors in sway.log are harmless (not installed).
+
+## No-root fallback: extract packages + cage (when sudo is broken)
+
+Arch packages are plain zstd tarballs — extract into a prefix, no root needed:
+
+```bash
+P=/tmp/claude-1000/prefix; mkdir -p $P /tmp/claude-1000/pkgs; cd /tmp/claude-1000/pkgs
+M=https://geo.mirror.pkgbuild.com/extra/os/x86_64
+curl -s $M/ > listing.html   # grep for exact filenames: href="cage-...pkg.tar.zst"
+# needed: cage wlroots0.20 seatd libliftoff vulkan-swrast grim libpng xcb-util-errors
+curl -sO "$M/<file>" && tar --zstd -xf "./<file>" -C $P     # note the ./ — a bare
+# name containing ':' (epoch, urlencoded %3A) makes tar dial it as a remote host
+LD_LIBRARY_PATH=$P/usr/lib ldd $P/usr/bin/cage | grep "not found"   # fetch what's missing
+```
+
+- The lavapipe ICD is `$P/usr/share/vulkan/icd.d/lvp_icd.json` (no `.x86_64`
+  suffix) with a *relative* `library_path` — resolved via `LD_LIBRARY_PATH`,
+  no sed needed. Point the app at it with `VK_DRIVER_FILES=$P/.../lvp_icd.json`
+  (the system nvidia/radeon ICDs fail without a GPU).
+- **cage** is a simpler compositor than sway for this: it needs no config and
+  kiosk-runs one app fullscreen (headless output is 1280x720):
+
+```bash
+env LD_LIBRARY_PATH=$P/usr/lib VK_DRIVER_FILES=$P/usr/share/vulkan/icd.d/lvp_icd.json \
+  WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman \
+  $P/usr/bin/cage -- ./target/debug/<app> &
+# socket appears as $XDG_RUNTIME_DIR/wayland-0 (not wayland-1 as with sway)
+# "Xwayland startup failed"/segfault in the log is harmless for Wayland-native apps
+LD_LIBRARY_PATH=$P/usr/lib $P/usr/bin/grim shot.png
+```
+
+## Keyboard without wtype: wlpoint virtual keyboard
+
+`tools/wlpoint` also speaks zwp_virtual_keyboard_v1. Generate a keymap once
+(`xkbcli compile-keymap --layout us > /tmp/claude-1000/keymap.xkb` — xkbcli
+ships with libxkbcommon), export `WLPOINT_KEYMAP=/tmp/claude-1000/keymap.xkb`,
+then use `key enter|escape|tab|space|up|down|left|right|<evdev-code>` in serve
+mode. Enough for accepting claude's trust/permission prompts (enter, down);
+it does NOT type text — for text entry you still need wtype (sudo image only).
+
+Focus gotcha: clicking a button that *spawns* a terminal does not focus the
+terminal — click inside the terminal area before sending keys.
 
 ## Run the app + screenshot + input
 

@@ -8,4 +8,5 @@ description = "Inject pointer events into a wlroots compositor (zwlr_virtual_poi
 
 [dependencies]
 wayland-client = "0.31"
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }

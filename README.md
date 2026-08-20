@@ -15,11 +15,13 @@ and interact with each agent through an embedded terminal.
   on an existing PR it has the form `#<PR number> <short description>`
   (open PRs are fed to the planner via `gh pr list` when available) — and
   can be edited inline via the row's *edit* button or by double-clicking
-  the row. The sidebar is collapsible (the `◂`/`▸` buttons) and its width
-  can be adjusted by dragging the divider; both persist.
+  the row. Projects are added via the system directory picker (`+ Add` in
+  the sidebar's bottom bar). The sidebar is collapsible (the `◂`/`▸`
+  buttons, also in the bottom bar) and its width can be adjusted by
+  dragging the divider; both persist.
 - **Right pane** — the selected agent's terminal (a real PTY running
   claude-code), filling the pane.
-- **Settings** — the gear button at the bottom of the sidebar opens the
+- **Settings** — the gear button in the sidebar's bottom bar opens the
   settings dialog: base font size (UI and terminal scale together), the
   theme (light by default, dark available — covers the UI and the
   terminal's ANSI palette), and

@@ -25,10 +25,6 @@ struct PresetInputs {
 }
 
 enum Dialog {
-    AddProject {
-        input: Entity<TextInput>,
-        _subscription: Subscription,
-    },
     NewAgent {
         project_path: PathBuf,
         input: Entity<TextInput>,
@@ -123,27 +119,34 @@ impl Workspace {
 
     // ---- Projects ----
 
-    fn open_add_project_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| TextInput::new("/path/to/git/repository", cx));
-        let subscription = cx.subscribe(
-            &input,
-            |this, _input, event: &InputEvent, cx| match event {
-                InputEvent::Submitted(text) => {
-                    let text = text.trim().to_string();
-                    this.add_project(text, cx);
-                }
-                InputEvent::Cancelled => {
-                    this.dialog = None;
-                    cx.notify();
-                }
-            },
-        );
-        window.focus(&input.focus_handle(cx));
-        self.dialog = Some(Dialog::AddProject {
-            input,
-            _subscription: subscription,
+    fn add_project_via_picker(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Add project".into()),
         });
-        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let picked = match receiver.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                Ok(Ok(None)) => None, // user cancelled
+                Ok(Err(error)) => {
+                    this.update(cx, |this, cx| {
+                        this.set_status(format!("File picker failed: {error}"), true, cx);
+                    })
+                    .ok();
+                    None
+                }
+                Err(_) => None,
+            };
+            if let Some(path) = picked {
+                this.update(cx, |this, cx| {
+                    this.add_project(path.to_string_lossy().into_owned(), cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     fn add_project(&mut self, path: String, cx: &mut Context<Self>) {
@@ -597,10 +600,11 @@ impl Workspace {
                 .bg(theme::panel_bg())
                 .border_r_1()
                 .border_color(theme::border())
+                .child(div().flex_1())
                 .child(
                     div()
                         .id("expand-sidebar")
-                        .mt_2()
+                        .mb_2()
                         .px_1()
                         .rounded_sm()
                         .cursor_pointer()
@@ -624,7 +628,7 @@ impl Workspace {
                     .p_2()
                     .text_color(theme::fg_dim())
                     .text_sm()
-                    .child("No projects yet. Add a git repository to get started."),
+                    .child("No projects yet. Use + Add below to pick a git repository."),
             );
         }
 
@@ -846,7 +850,6 @@ impl Workspace {
                 div()
                     .flex()
                     .items_center()
-                    .justify_between()
                     .px_3()
                     .py_2()
                     .border_b_1()
@@ -856,27 +859,22 @@ impl Workspace {
                             .text_color(theme::fg())
                             .text_sm()
                             .child("Projects"),
-                    )
+                    ),
+            )
+            .child(div().flex_1().overflow_hidden().child(list))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .p_2()
+                    .border_t_1()
+                    .border_color(theme::border())
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(
-                                div()
-                                    .id("add-project")
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_sm()
-                                    .text_color(theme::accent())
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme::hover_bg()))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_add_project_dialog(window, cx);
-                                    }))
-                                    .child("+ Add"),
-                            )
                             .child(
                                 div()
                                     .id("collapse-sidebar")
@@ -893,17 +891,23 @@ impl Workspace {
                                         cx.notify();
                                     }))
                                     .child("◂"),
+                            )
+                            .child(
+                                div()
+                                    .id("add-project")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .text_color(theme::accent())
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::hover_bg()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.add_project_via_picker(cx);
+                                    }))
+                                    .child("+ Add"),
                             ),
-                    ),
-            )
-            .child(div().flex_1().overflow_hidden().child(list))
-            .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .p_2()
-                    .border_t_1()
-                    .border_color(theme::border())
+                    )
                     .child(
                         div()
                             .id("open-settings")
@@ -1138,25 +1142,6 @@ impl Workspace {
         let dialog = self.dialog.as_ref()?;
 
         let panel = match dialog {
-            Dialog::AddProject { input, .. } => div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .w(px(560.))
-                .p_4()
-                .rounded_sm()
-                .bg(theme::panel_bg())
-                .border_1()
-                .border_color(theme::border())
-                .child(
-                    div()
-                        .text_color(theme::fg())
-                        .child("Add project (path to a git repository)"),
-                )
-                .child(input.clone())
-                .child(self.dialog_buttons("Add", cx))
-                .into_any_element(),
-
             Dialog::NewAgent {
                 input,
                 planning,
@@ -1384,10 +1369,6 @@ impl Workspace {
 
     fn submit_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.dialog {
-            Some(Dialog::AddProject { input, .. }) => {
-                let text = input.read(cx).text().trim().to_string();
-                self.add_project(text, cx);
-            }
             Some(Dialog::NewAgent {
                 project_path,
                 input,

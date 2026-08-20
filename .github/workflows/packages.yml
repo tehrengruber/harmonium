@@ -1,0 +1,152 @@
+name: Packages
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    # Full release builds are expensive; on PRs only run them when something
+    # that can break packaging changed.
+    paths:
+      - 'packaging/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/packages.yml'
+      - '.github/actions/**'
+  workflow_dispatch:
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ubuntu:
+    name: Ubuntu (.deb)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/linux-build-deps
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build .deb
+        # cargo-deb runs the release build itself and derives library
+        # dependencies from the resulting binary (dpkg-shlibdeps).
+        run: cargo deb --output dist/
+
+      - name: Label the artifact with the distribution it was built on
+        id: pkg
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          deb=$(find dist -maxdepth 1 -name '*.deb' -print -quit)
+          labelled="dist/$(basename "${deb%.deb}")_${ID}-${VERSION_ID}.deb"
+          mv "$deb" "$labelled"
+          echo "path=$labelled" >>"$GITHUB_OUTPUT"
+          dpkg-deb --info "$labelled"
+          dpkg-deb --contents "$labelled"
+
+      - name: Verify the package installs
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y "$PWD/${{ steps.pkg.outputs.path }}"
+          command -v harmonium
+          dpkg -s harmonium | sed -n '1,20p'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: harmonium-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+  arch:
+    name: Arch Linux (pkg.tar.zst)
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    timeout-minutes: 90
+    steps:
+      - name: Install build dependencies
+        run: |
+          set -eux
+          pacman -Syu --noconfirm --needed \
+            git sudo rust cmake clang pkgconf \
+            fontconfig freetype2 libxkbcommon libxkbcommon-x11 \
+            wayland wayland-protocols vulkan-headers vulkan-icd-loader \
+            libx11 libxcb libxau libxdmcp alsa-lib openssl zstd
+
+      - uses: actions/checkout@v4
+
+      - name: Create the source tarball makepkg builds from
+        run: |
+          set -eux
+          git config --global --add safe.directory "$PWD"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "PKGVER=$version" >>"$GITHUB_ENV"
+          # Keep the PKGBUILD's pkgver in lockstep with Cargo.toml.
+          sed -i "s/^pkgver=.*/pkgver=$version/" packaging/arch/PKGBUILD
+          git archive --format=tar.gz --prefix="harmonium-$version/" \
+            -o "packaging/arch/harmonium-$version.tar.gz" HEAD
+
+      - name: Build the package
+        # makepkg refuses to run as root, so build as an unprivileged user
+        # with passwordless sudo for its dependency check.
+        run: |
+          set -eux
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' >/etc/sudoers.d/builder
+          chown -R builder:builder .
+          sudo -u builder bash -c 'cd packaging/arch && makepkg -sf --noconfirm'
+
+      - name: Inspect and install-test the package
+        run: |
+          set -eux
+          pkg=$(find packaging/arch -maxdepth 1 -name '*.pkg.tar.zst' -print -quit)
+          pacman -Qip "$pkg"
+          pacman -Qlp "$pkg"
+          pacman -U --noconfirm "$pkg"
+          command -v harmonium
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: harmonium-arch
+          path: packaging/arch/*.pkg.tar.zst
+          if-no-files-found: error
+
+  release:
+    name: Attach packages to the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ubuntu, arch]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload to the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Harmonium
+GenericName=Agent Orchestrator
+Comment=Manage git projects, spawn coding agents into worktrees, and drive them from embedded terminals
+Exec=harmonium
+Terminal=false
+Categories=Development;IDE;
+Keywords=agent;terminal;git;worktree;claude;
+StartupNotify=true

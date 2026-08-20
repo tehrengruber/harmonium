@@ -1,5 +1,8 @@
 # Harmonium
 
+[![CI](https://github.com/tehrengruber/harmonium/actions/workflows/ci.yml/badge.svg)](https://github.com/tehrengruber/harmonium/actions/workflows/ci.yml)
+[![Packages](https://github.com/tehrengruber/harmonium/actions/workflows/packages.yml/badge.svg)](https://github.com/tehrengruber/harmonium/actions/workflows/packages.yml)
+
 A GPUI-based agent orchestrator: a terminal emulator with orchestration UI on
 top. Manage projects (git repositories), spawn coding agents (claude-code)
 into per-branch git worktrees derived from a plain-language task description,
@@ -83,6 +86,43 @@ button that runs `claude --continue` in the agent's workdir.
 Base font size defaults to 12 px and is adjustable in the settings panel
 (stored in `state.json`).
 
+An agent preset command may start with shell-style `KEY=value` words, which
+become environment for that agent's process:
+
+```
+CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude
+```
+
+`CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` is **optional**: the claude CLI
+normally runs on the *alternate screen*, where the transcript belongs to the
+program and it drives scrolling and selection through mouse reporting (which
+works out of the box, see below). Set the variable if you would rather have
+the agent render inline, so its output lands in the terminal's own
+scrollback and is scrolled and selected like any other output — at the cost
+of claude's own scrollback UI. `CLAUDE_CODE_DISABLE_MOUSE=1` similarly hands
+the mouse back to the terminal.
+
+## Terminal scrolling & selection
+
+- Mouse wheel scrolls the scrollback. If the running program tracks the
+  mouse, the wheel is reported to it instead; on the alternate screen with
+  alternate-scroll enabled it is translated to arrow keys — the same
+  dispatch xterm and alacritty use, so pagers and TUIs scroll as expected.
+- Programs that ask for mouse tracking (`?1000`/`?1002`/`?1003`, SGR or the
+  legacy encoding) receive presses, drags and releases, so full-screen TUIs
+  like the agent run their own selection and scrolling over their own
+  scrollback. **Hold shift** to take the mouse back and select with the
+  terminal instead — the xterm/VTE convention. Shift also keeps the wheel on
+  the terminal's scrollback.
+- Click-drag selects; double/triple click select word/line. Dragging past
+  the top or bottom edge auto-scrolls and keeps extending the selection,
+  which is how a selection grows beyond one screenful.
+- `ctrl-shift-c` copies the selection, including the parts scrolled out of
+  view; `ctrl-shift-v` pastes.
+- The selection is owned by the terminal, not by the parser: a program that
+  erases and redraws its region (any Ink-style TUI does this several times a
+  second) cannot wipe a selection out from under the user.
+
 ## Building
 
 ```bash
@@ -91,6 +131,9 @@ cargo build --release
 
 Needs the usual GPUI Linux dependencies (Wayland/X11 headers, fontconfig,
 freetype, libxkbcommon, Vulkan loader). GPUI is pinned to Zed tag `v0.217.5`.
+The exact Debian/Ubuntu package list lives in
+`.github/actions/linux-build-deps/action.yml`; the Arch list is in
+`packaging/arch/PKGBUILD` (and in the headless-testing skill).
 
 `harmonium plan <repo> <task…>` prints the derived plan without starting the UI
 (debugging helper).
@@ -103,6 +146,46 @@ freetype, libxkbcommon, Vulkan loader). GPUI is pinned to Zed tag `v0.217.5`.
 - Headless UI testing (screenshots + synthetic input under a headless
   Wayland compositor): see `.claude/skills/headless-gui-testing/SKILL.md`.
   `tools/wlpoint` is the pointer-injection helper used there.
+
+## CI
+
+| Workflow | Trigger | What it does |
+| --- | --- | --- |
+| `.github/workflows/ci.yml` | push to `main`, every PR | debug build of all targets, `cargo test`, release build (uploaded as an artifact); a second, advisory job runs clippy and prints the rustfmt diff |
+| `.github/workflows/packages.yml` | push to `main`, `v*` tags, packaging-related PRs, manual | builds the Ubuntu `.deb` and the Arch package, install-tests both, and on a tag attaches them to the GitHub release |
+| `.github/workflows/smoke.yml` | manual, weekly | starts the real binary under headless sway with a software Vulkan renderer and asserts the window painted; uploads the screenshot |
+
+Clippy is advisory (`continue-on-error`) because the tree still carries a few
+pre-existing lint warnings — clear them and the job can be made blocking with
+`-- -D warnings`. `cargo fmt --check` is intentionally not a gate: the source
+is hand-wrapped at ~80 columns, which rustfmt's defaults disagree with.
+
+## Packaging
+
+- **Ubuntu/Debian** — [`cargo-deb`](https://github.com/kornelski/cargo-deb),
+  configured under `[package.metadata.deb]` in `Cargo.toml`:
+
+  ```bash
+  cargo install cargo-deb
+  cargo deb --output dist/
+  ```
+
+  Library dependencies are derived from the binary; `libwayland-client0`,
+  `libvulkan1` and `git` are declared explicitly because GPUI dlopens the
+  first two and the planner shells out to the third.
+
+- **Arch Linux** — `packaging/arch/PKGBUILD`, which builds from a `git
+  archive` tarball and runs `cargo test` in its `check()`:
+
+  ```bash
+  version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+  git archive --format=tar.gz --prefix="harmonium-$version/" \
+    -o "packaging/arch/harmonium-$version.tar.gz" HEAD
+  (cd packaging/arch && makepkg -sf)
+  ```
+
+Both install `/usr/bin/harmonium` plus `packaging/harmonium.desktop`. Tagging
+`vX.Y.Z` builds both and uploads them to the matching GitHub release.
 
 ## Architecture
 

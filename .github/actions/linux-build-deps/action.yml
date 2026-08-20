@@ -1,0 +1,24 @@
+name: Linux build dependencies
+description: >
+  Install the system packages GPUI/harmonium needs to build on Debian/Ubuntu
+  runners. Kept in one place so CI and the packaging workflow can't drift.
+
+runs:
+  using: composite
+  steps:
+    - name: apt-get install build dependencies
+      shell: bash
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential pkg-config cmake clang libclang-dev git curl \
+          libfontconfig-dev libfreetype-dev \
+          libxkbcommon-dev libxkbcommon-x11-dev \
+          libwayland-dev wayland-protocols \
+          libvulkan-dev \
+          libx11-dev libx11-xcb-dev \
+          libxcb1-dev libxcb-xkb-dev libxcb-randr0-dev libxcb-shape0-dev \
+          libxcb-xfixes0-dev libxcb-render0-dev libxcb-image0-dev \
+          libxcb-keysyms1-dev libxcb-icccm4-dev \
+          libasound2-dev libssl-dev libzstd-dev

@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: build & test
+    runs-on: ubuntu-latest
+    # A cold cache compiles GPUI (pinned to a Zed git tag) from scratch.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/linux-build-deps
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (debug, all targets)
+        run: cargo build --locked --all-targets
+
+      - name: Test
+        # Covers planner JSON parsing plus the full worktree lifecycle against
+        # a scratch git repo; the lifecycle test sets its own git identity.
+        run: cargo test --locked -- --nocapture
+
+      - name: Build (release)
+        run: cargo build --locked --release
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: harmonium-x86_64-unknown-linux-gnu
+          path: target/release/harmonium
+          if-no-files-found: error
+
+  lint:
+    name: clippy (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Advisory for now: the tree carries a handful of pre-existing clippy
+    # warnings. Clear them, then drop this line and add `-- -D warnings` to
+    # make lints blocking.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/linux-build-deps
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets
+
+      - name: Rustfmt diff
+        # Not `--check`: the source is hand-wrapped at ~80 columns, which
+        # rustfmt's defaults disagree with. Printed for information only.
+        run: cargo fmt --all -- --check || true

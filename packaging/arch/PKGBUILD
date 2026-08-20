@@ -1,0 +1,60 @@
+# Maintainer: Till Ehrengruber <tehrengruber@users.noreply.github.com>
+#
+# Builds from a source tarball produced by `git archive` — see
+# .github/workflows/packages.yml, which also keeps `pkgver` in sync with
+# Cargo.toml. To build by hand from a checkout:
+#
+#   version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+#   git archive --format=tar.gz --prefix="harmonium-$version/" \
+#     -o "packaging/arch/harmonium-$version.tar.gz" HEAD
+#   (cd packaging/arch && makepkg -sf)
+
+pkgname=harmonium
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="GPUI-based agent orchestrator: projects, agents, and embedded terminals"
+arch=('x86_64')
+url="https://github.com/tehrengruber/harmonium"
+license=('MIT')
+# git is a runtime dependency: worktrees are created by shelling out to it.
+# wayland/vulkan are dlopened by GPUI rather than linked, so they are not
+# picked up automatically.
+depends=('gcc-libs' 'glibc' 'libxkbcommon' 'libxkbcommon-x11' 'libxcb' 'libxau'
+         'libxdmcp' 'wayland' 'vulkan-icd-loader' 'fontconfig' 'git')
+makedepends=('cargo' 'cmake' 'clang' 'pkgconf' 'git' 'wayland-protocols'
+             'vulkan-headers' 'freetype2' 'alsa-lib' 'openssl' 'zstd')
+optdepends=('vulkan-swrast: software Vulkan renderer for machines without a GPU driver'
+            'claude-code: default agent and planner backend'
+            'github-cli: feeds open pull requests to the task planner'
+            'ttf-dejavu: default UI and terminal fonts')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export CARGO_HOME="$srcdir/cargo-home"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export CARGO_HOME="$srcdir/cargo-home"
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export CARGO_HOME="$srcdir/cargo-home"
+  export CARGO_TARGET_DIR=target
+  # Planner JSON parsing + the git worktree lifecycle. No network, no display.
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm644 packaging/harmonium.desktop \
+    "$pkgdir/usr/share/applications/$pkgname.desktop"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

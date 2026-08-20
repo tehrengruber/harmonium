@@ -1,0 +1,93 @@
+name: Headless smoke test
+
+# Best-effort end-to-end check that the GUI actually starts and paints under a
+# headless Wayland compositor with a software Vulkan renderer (lavapipe) — the
+# recipe from .claude/skills/headless-gui-testing/SKILL.md. Deliberately not
+# wired to pull requests: it is timing-dependent, so it runs on demand and
+# once a week, and uploads its screenshot either way.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: launch under headless sway
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/linux-build-deps
+
+      - name: Install a headless compositor, a software GPU and a font
+        run: |
+          set -eux
+          sudo apt-get install -y --no-install-recommends \
+            sway grim imagemagick mesa-vulkan-drivers libvulkan1 \
+            fonts-dejavu-core
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+
+      - name: Build (release)
+        run: cargo build --locked --release
+
+      - name: Start sway (headless)
+        run: |
+          set -eux
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg"
+          mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >>"$GITHUB_ENV"
+          cat >"$RUNNER_TEMP/sway.conf" <<'EOF'
+          output HEADLESS-1 resolution 1280x820
+          default_border none
+          EOF
+          WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman \
+            sway -c "$RUNNER_TEMP/sway.conf" >"$RUNNER_TEMP/sway.log" 2>&1 &
+          for _ in $(seq 30); do
+            [ -S "$XDG_RUNTIME_DIR/wayland-1" ] && break
+            sleep 1
+          done
+          test -S "$XDG_RUNTIME_DIR/wayland-1"
+          echo "WAYLAND_DISPLAY=wayland-1" >>"$GITHUB_ENV"
+
+      - name: Launch harmonium and screenshot it
+        run: |
+          set -eux
+          # Never touch the runner's real data dir; start from empty state.
+          export HARMONIUM_DATA_DIR="$RUNNER_TEMP/harmonium-data"
+          RUST_LOG=info ./target/release/harmonium \
+            >"$RUNNER_TEMP/harmonium.log" 2>&1 &
+          app=$!
+          sleep 20
+          kill -0 "$app"  # still alive, i.e. it did not crash on startup
+          grim "$RUNNER_TEMP/screenshot.png"
+          kill "$app"
+
+      - name: Assert the window actually painted
+        run: |
+          set -eux
+          im=$(command -v magick || command -v convert)
+          colors=$("$im" "$RUNNER_TEMP/screenshot.png" -format %c histogram:info:- | wc -l)
+          echo "distinct colors: $colors"
+          # A black/blank frame yields one or two colors; a painted UI has
+          # background, borders, and anti-aliased text.
+          test "$colors" -gt 5
+
+      - name: Upload screenshot and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-artifacts
+          path: |
+            ${{ runner.temp }}/screenshot.png
+            ${{ runner.temp }}/sway.log
+            ${{ runner.temp }}/harmonium.log
+          if-no-files-found: warn

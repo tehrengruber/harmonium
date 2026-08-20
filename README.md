@@ -20,7 +20,9 @@ and interact with each agent through an embedded terminal.
 - **Right pane** — the selected agent's terminal (a real PTY running
   claude-code), filling the pane.
 - **Settings** — the gear button at the bottom of the sidebar opens the
-  settings dialog: base font size (UI and terminal scale together) and
+  settings dialog: base font size (UI and terminal scale together), the
+  theme (light by default, dark available — covers the UI and the
+  terminal's ANSI palette), and
   **agent presets**. A preset is a named command pair — the spawn command
   (task text appended as the last argument) and the resume command. Three
   defaults ship: plain `claude`, and two sandboxed variants via

@@ -71,6 +71,7 @@ impl Workspace {
         cx.set_global(theme::FontSettings {
             base: state.settings.font_size,
         });
+        theme::set_mode(state.settings.theme);
         Self {
             state,
             terminals: HashMap::new(),
@@ -91,6 +92,17 @@ impl Workspace {
         self.state.settings.font_size = new_size;
         self.persist(cx);
         // Terminals re-measure their cell size on next paint; wake them up.
+        let views: Vec<_> = self.terminals.values().cloned().collect();
+        for view in views {
+            view.update(cx, |_, cx| cx.notify());
+        }
+        cx.notify();
+    }
+
+    fn set_theme(&mut self, mode: theme::ThemeMode, cx: &mut Context<Self>) {
+        theme::set_mode(mode);
+        self.state.settings.theme = mode;
+        self.persist(cx);
         let views: Vec<_> = self.terminals.values().cloned().collect();
         for view in views {
             view.update(cx, |_, cx| cx.notify());
@@ -1084,6 +1096,44 @@ impl Workspace {
             )
     }
 
+    fn render_theme_row(&self, cx: &Context<Self>) -> impl IntoElement {
+        let current = theme::mode();
+        let chip = |label: &'static str,
+                    mode: theme::ThemeMode,
+                    cx: &Context<Self>| {
+            let selected = current == mode;
+            div()
+                .id(label)
+                .px_2()
+                .py_0p5()
+                .rounded_md()
+                .text_sm()
+                .cursor_pointer()
+                .bg(if selected {
+                    theme::accent()
+                } else {
+                    theme::selected_bg()
+                })
+                .text_color(if selected {
+                    theme::panel_bg()
+                } else {
+                    theme::fg()
+                })
+                .hover(|s| s.opacity(0.85))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_theme(mode, cx);
+                }))
+                .child(label)
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(div().text_color(theme::fg_dim()).text_sm().child("Theme"))
+            .child(chip("Light", theme::ThemeMode::Light, cx))
+            .child(chip("Dark", theme::ThemeMode::Dark, cx))
+    }
+
     fn render_dialog(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
         let dialog = self.dialog.as_ref()?;
 
@@ -1282,6 +1332,7 @@ impl Workspace {
                             .flex_col()
                             .gap_2()
                             .child(self.render_font_size_row(cx))
+                            .child(self.render_theme_row(cx))
                             .child(
                                 div()
                                     .text_color(theme::fg())

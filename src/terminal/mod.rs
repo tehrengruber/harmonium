@@ -439,7 +439,7 @@ fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> 
 }
 
 // One Dark-ish 16-color palette.
-const PALETTE: [u32; 16] = [
+const DARK_PALETTE: [u32; 16] = [
     0x3f4451, // black
     0xe05561, // red
     0x8cc265, // green
@@ -458,8 +458,47 @@ const PALETTE: [u32; 16] = [
     0xe6e6e6, // bright white
 ];
 
-pub const DEFAULT_FG: u32 = 0xabb2bf;
-pub const DEFAULT_BG: u32 = 0x282c33;
+// One Light-ish 16-color palette.
+const LIGHT_PALETTE: [u32; 16] = [
+    0x383a42, // black
+    0xe45649, // red
+    0x50a14f, // green
+    0xc18401, // yellow
+    0x4078f2, // blue
+    0xa626a4, // magenta
+    0x0184bc, // cyan
+    0xa0a1a7, // white
+    0x696c77, // bright black
+    0xca1243, // bright red
+    0x23974a, // bright green
+    0xdf6c1c, // bright yellow
+    0x275fe4, // bright blue
+    0x823ff1, // bright magenta
+    0x27618d, // bright cyan
+    0x0f1013, // bright white
+];
+
+fn palette() -> &'static [u32; 16] {
+    match crate::theme::mode() {
+        crate::theme::ThemeMode::Dark => &DARK_PALETTE,
+        crate::theme::ThemeMode::Light => &LIGHT_PALETTE,
+    }
+}
+
+fn pick(dark: u32, light: u32) -> u32 {
+    match crate::theme::mode() {
+        crate::theme::ThemeMode::Dark => dark,
+        crate::theme::ThemeMode::Light => light,
+    }
+}
+
+pub fn default_fg_hex() -> u32 {
+    pick(0xabb2bf, 0x383a42)
+}
+
+pub fn default_bg_hex() -> u32 {
+    pick(0x282c33, 0xfafafa)
+}
 
 pub fn hex_to_rgb(hex: u32) -> AnsiRgb {
     AnsiRgb {
@@ -472,7 +511,7 @@ pub fn hex_to_rgb(hex: u32) -> AnsiRgb {
 /// Resolve an indexed color (0-255 plus alacritty's special indices) to RGB.
 pub fn palette_rgb(index: usize) -> AnsiRgb {
     match index {
-        0..=15 => hex_to_rgb(PALETTE[index]),
+        0..=15 => hex_to_rgb(palette()[index]),
         16..=231 => {
             let i = index - 16;
             let to_channel = |v: usize| -> u8 {
@@ -492,39 +531,40 @@ pub fn palette_rgb(index: usize) -> AnsiRgb {
             let v = (8 + (index - 232) * 10) as u8;
             AnsiRgb { r: v, g: v, b: v }
         }
-        _ => hex_to_rgb(DEFAULT_FG),
+        _ => hex_to_rgb(default_fg_hex()),
     }
 }
 
 pub fn named_color_rgb(color: NamedColor) -> AnsiRgb {
     use NamedColor::*;
+    let palette = palette();
     match color {
-        Foreground | Cursor => hex_to_rgb(DEFAULT_FG),
-        Background => hex_to_rgb(DEFAULT_BG),
-        Black => hex_to_rgb(PALETTE[0]),
-        Red => hex_to_rgb(PALETTE[1]),
-        Green => hex_to_rgb(PALETTE[2]),
-        Yellow => hex_to_rgb(PALETTE[3]),
-        Blue => hex_to_rgb(PALETTE[4]),
-        Magenta => hex_to_rgb(PALETTE[5]),
-        Cyan => hex_to_rgb(PALETTE[6]),
-        White => hex_to_rgb(PALETTE[7]),
-        BrightBlack => hex_to_rgb(PALETTE[8]),
-        BrightRed => hex_to_rgb(PALETTE[9]),
-        BrightGreen => hex_to_rgb(PALETTE[10]),
-        BrightYellow => hex_to_rgb(PALETTE[11]),
-        BrightBlue => hex_to_rgb(PALETTE[12]),
-        BrightMagenta => hex_to_rgb(PALETTE[13]),
-        BrightCyan => hex_to_rgb(PALETTE[14]),
-        BrightWhite | BrightForeground => hex_to_rgb(PALETTE[15]),
-        DimBlack => hex_to_rgb(0x2a2e39),
-        DimRed => hex_to_rgb(0x99404a),
-        DimGreen => hex_to_rgb(0x5e8245),
-        DimYellow => hex_to_rgb(0x8f6238),
-        DimBlue => hex_to_rgb(0x3371a3),
-        DimMagenta | DimForeground => hex_to_rgb(0x854397),
-        DimCyan => hex_to_rgb(0x2e7a84),
-        DimWhite => hex_to_rgb(0x92959c),
+        Foreground | Cursor => hex_to_rgb(default_fg_hex()),
+        Background => hex_to_rgb(default_bg_hex()),
+        Black => hex_to_rgb(palette[0]),
+        Red => hex_to_rgb(palette[1]),
+        Green => hex_to_rgb(palette[2]),
+        Yellow => hex_to_rgb(palette[3]),
+        Blue => hex_to_rgb(palette[4]),
+        Magenta => hex_to_rgb(palette[5]),
+        Cyan => hex_to_rgb(palette[6]),
+        White => hex_to_rgb(palette[7]),
+        BrightBlack => hex_to_rgb(palette[8]),
+        BrightRed => hex_to_rgb(palette[9]),
+        BrightGreen => hex_to_rgb(palette[10]),
+        BrightYellow => hex_to_rgb(palette[11]),
+        BrightBlue => hex_to_rgb(palette[12]),
+        BrightMagenta => hex_to_rgb(palette[13]),
+        BrightCyan => hex_to_rgb(palette[14]),
+        BrightWhite | BrightForeground => hex_to_rgb(palette[15]),
+        DimBlack => hex_to_rgb(pick(0x2a2e39, 0x8b8f98)),
+        DimRed => hex_to_rgb(pick(0x99404a, 0xdf9a92)),
+        DimGreen => hex_to_rgb(pick(0x5e8245, 0x9cc59b)),
+        DimYellow => hex_to_rgb(pick(0x8f6238, 0xd9bd7f)),
+        DimBlue => hex_to_rgb(pick(0x3371a3, 0x9cb6ef)),
+        DimMagenta | DimForeground => hex_to_rgb(pick(0x854397, 0xcf9ace)),
+        DimCyan => hex_to_rgb(pick(0x2e7a84, 0x86b9d0)),
+        DimWhite => hex_to_rgb(pick(0x92959c, 0xc9cbd0)),
     }
 }
 

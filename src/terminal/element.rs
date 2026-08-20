@@ -12,7 +12,7 @@ use gpui::{
     StrikethroughStyle, TextRun, UnderlineStyle, Window,
 };
 
-use super::{resolve_color, rgb_to_hsla, Terminal, TerminalSize, DEFAULT_BG};
+use super::{resolve_color, rgb_to_hsla, Terminal, TerminalSize};
 use crate::theme;
 
 pub struct TerminalElement {
@@ -119,7 +119,7 @@ impl Element for TerminalElement {
         };
         self.terminal.update(cx, |terminal, _| terminal.resize(new_size));
 
-        let default_bg = rgb_to_hsla(super::hex_to_rgb(DEFAULT_BG));
+        let default_bg = rgb_to_hsla(super::hex_to_rgb(super::default_bg_hex()));
         let num_rows = new_size.rows();
 
         // Collect per-row text + style runs and background quads while the

@@ -1,6 +1,42 @@
-//! Centralized colors and fonts (One Dark-ish palette).
+//! Centralized colors and fonts. Two palettes (One Light-ish / One Dark-ish)
+//! selected by a runtime theme mode.
 
 use gpui::{px, rgb, App, Font, FontFeatures, FontStyle, FontWeight, Global, Hsla, Pixels, SharedString};
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    #[default]
+    Light,
+    Dark,
+}
+
+// A process-wide flag rather than a gpui Global so the plain color fns below
+// (called from ~100 sites, including element paint code) keep their no-arg
+// signatures.
+static DARK: AtomicBool = AtomicBool::new(false);
+
+pub fn set_mode(mode: ThemeMode) {
+    DARK.store(mode == ThemeMode::Dark, Ordering::Relaxed);
+}
+
+pub fn mode() -> ThemeMode {
+    if dark() {
+        ThemeMode::Dark
+    } else {
+        ThemeMode::Light
+    }
+}
+
+fn dark() -> bool {
+    DARK.load(Ordering::Relaxed)
+}
+
+fn pick(dark_hex: u32, light_hex: u32) -> Hsla {
+    rgb(if dark() { dark_hex } else { light_hex }).into()
+}
 
 /// Base font size, adjustable at runtime from the settings panel and stored
 /// as a GPUI global so render code anywhere (including the terminal element)
@@ -33,43 +69,43 @@ pub fn terminal_font_size(cx: &App) -> Pixels {
 }
 
 pub fn bg() -> Hsla {
-    rgb(0x21252b).into()
+    pick(0x21252b, 0xf2f3f5)
 }
 pub fn panel_bg() -> Hsla {
-    rgb(0x1b1f23).into()
+    pick(0x1b1f23, 0xe9eaee)
 }
 pub fn terminal_bg() -> Hsla {
-    rgb(0x282c33).into()
+    pick(0x282c33, 0xfafafa)
 }
 pub fn terminal_selection_bg() -> Hsla {
-    rgb(0x3e4f6f).into()
+    pick(0x3e4f6f, 0xbfd4ef)
 }
 pub fn fg() -> Hsla {
-    rgb(0xabb2bf).into()
+    pick(0xabb2bf, 0x383a42)
 }
 pub fn fg_dim() -> Hsla {
-    rgb(0x6b717d).into()
+    pick(0x6b717d, 0x8a8f98)
 }
 pub fn border() -> Hsla {
-    rgb(0x3f4451).into()
+    pick(0x3f4451, 0xd0d3d9)
 }
 pub fn accent() -> Hsla {
-    rgb(0x4aa5f0).into()
+    pick(0x4aa5f0, 0x2b6fd0)
 }
 pub fn selected_bg() -> Hsla {
-    rgb(0x2c313a).into()
+    pick(0x2c313a, 0xdde2ea)
 }
 pub fn hover_bg() -> Hsla {
-    rgb(0x323842).into()
+    pick(0x323842, 0xe2e6ec)
 }
 pub fn error() -> Hsla {
-    rgb(0xe05561).into()
+    pick(0xe05561, 0xca1243)
 }
 pub fn ok() -> Hsla {
-    rgb(0x8cc265).into()
+    pick(0x8cc265, 0x3f8b3f)
 }
 pub fn warn() -> Hsla {
-    rgb(0xd18f52).into()
+    pick(0xd18f52, 0xbf6c00)
 }
 
 pub fn ui_font() -> Font {

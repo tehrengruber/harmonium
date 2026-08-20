@@ -94,6 +94,7 @@ pub struct SettingsRecord {
     /// Index of the preset last used to spawn an agent (preselected in the
     /// spawn dialog).
     pub last_preset: usize,
+    pub theme: crate::theme::ThemeMode,
 }
 
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 280.;
@@ -106,6 +107,7 @@ impl Default for SettingsRecord {
             sidebar_collapsed: false,
             presets: default_presets(),
             last_preset: 0,
+            theme: crate::theme::ThemeMode::default(),
         }
     }
 }

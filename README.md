@@ -73,7 +73,7 @@ button that runs `claude --continue` in the agent's workdir.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `HARMONIUM_AGENT_BIN` | – | Overrides the preset command entirely (testing) |
-| `HARMONIUM_PLANNER_BIN` | `claude` | LLM CLI used for task planning (`-p` mode) |
+| `HARMONIUM_PLANNER_CMD` | `claude -p --model haiku` | Planner command line; the planning prompt is appended as the last argument. Haiku is the default because planning is a tiny classification task — a `claude -p` call boots a full Claude Code session (~15–19K tokens of scaffolding), which costs ~$0.14 on a premium model but ~$0.003 on haiku with a warm prompt cache. |
 | `HARMONIUM_DATA_DIR` | `~/.local/share/harmonium` | State + worktrees |
 | `HARMONIUM_TERMINAL_FONT` | `DejaVu Sans Mono` | Terminal font family |
 | `HARMONIUM_UI_FONT` | `DejaVu Sans` | UI font family |

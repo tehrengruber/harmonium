@@ -126,8 +126,10 @@ fn open_prs(repo: &Path) -> Option<String> {
 }
 
 /// Ask the LLM to derive a plan from the task description. Uses the `claude`
-/// CLI in non-interactive print mode. Override the binary with
-/// `HARMONIUM_PLANNER_BIN` if needed.
+/// CLI in non-interactive print mode on a cheap model — planning is a small
+/// classification task, and a full-priced model would spend ~50x more on the
+/// same fixed session overhead. Override the whole command line (the prompt
+/// is appended as the final argument) with `HARMONIUM_PLANNER_CMD`.
 pub fn plan_task(repo: &Path, task: &str) -> Result<TaskPlan> {
     let locals = local_branches(repo);
     let remotes = remote_branches(repo);
@@ -158,9 +160,10 @@ Reply with ONLY a JSON object (no prose, no code fences) of this shape:
 }}
 
 Rules:
-- "existing_branch": the task refers to work on an existing branch or PR whose branch \
-appears in the lists above (match remote branches without the remote prefix; for a PR, \
-use its headRefName). Set "branch" to it.
+- "existing_branch": ONLY if the task refers to work on an existing branch or PR AND that \
+branch literally appears in the lists above (match remote branches without the remote \
+prefix; for a PR, use its headRefName). Set "branch" to it exactly as listed. Never \
+invent a branch name for this mode; if no listed branch matches, use "new_branch".
 - "new_branch": normal case for a fresh task. Set "branch" to a new kebab-case branch name \
 derived from the task, and "base_branch" to the branch to fork from ({default} unless the \
 task says otherwise).
@@ -174,13 +177,19 @@ about an existing pull request, it MUST have the form "#<PR number> <2-4 word su
         prs = prs.unwrap_or_else(|| "(none or unavailable)".into()),
     );
 
-    let bin = std::env::var("HARMONIUM_PLANNER_BIN").unwrap_or_else(|_| "claude".to_string());
-    let out = Command::new(&bin)
-        .arg("-p")
+    let command = std::env::var("HARMONIUM_PLANNER_CMD")
+        .unwrap_or_else(|_| "claude -p --model haiku".to_string());
+    let mut parts = split_command(&command);
+    if parts.is_empty() {
+        bail!("empty planner command");
+    }
+    let program = parts.remove(0);
+    let out = Command::new(&program)
+        .args(&parts)
         .arg(&prompt)
         .env_remove("ANTHROPIC_LOG")
         .output()
-        .with_context(|| format!("running planner `{bin}`"))?;
+        .with_context(|| format!("running planner `{command}`"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);

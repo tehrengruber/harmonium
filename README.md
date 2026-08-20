@@ -12,18 +12,22 @@ and interact with each agent through an embedded terminal.
 
 ## How it works
 
-- **Left sidebar** — list of projects; each project expands to its agents
-  (name + branch). A project is simply a path to a directory containing a
-  git repository. The agent name is LLM-generated from the task — for work
-  on an existing PR it has the form `#<PR number> <short description>`
-  (open PRs are fed to the planner via `gh pr list` when available) — and
-  can be edited inline via the row's *edit* button or by double-clicking
-  the row. Projects are added via the system directory picker (`+ Add` in
-  the sidebar's bottom bar). The sidebar is collapsible (the `◂`/`▸`
-  buttons, also in the bottom bar) and its width can be adjusted by
-  dragging the divider; both persist.
-- **Right pane** — the selected agent's terminal (a real PTY running
-  claude-code), filling the pane.
+- **Left sidebar** — list of projects; each project expands to its agents.
+  A project is simply a path to a directory containing a git repository.
+  The agent name is LLM-generated from the task — for work on an existing
+  PR it has the form `#<PR number> <short description>` (open PRs are fed
+  to the planner via `gh pr list` when available) — and can be edited
+  inline via the row's pencil button or by double-clicking the row.
+  Projects are added via the *New project* row at the end of the list,
+  which opens the system directory picker. The sidebar is collapsible
+  (the `◂`/`▸` buttons in the bottom bar, next to the settings gear) and
+  its width can be adjusted by dragging the divider; both persist.
+- **Right pane** — the selected agent as a tab view. The first tab
+  (*Agent*) is the agent session itself (a real PTY running claude-code);
+  the `+` button opens additional plain shell tabs in the agent's workdir.
+  Shell tabs persist: on restart the same tabs come back as fresh shells
+  with their previous scrollback (colors included) replayed above the new
+  prompt, so earlier output stays scrollable and selectable.
 - **Settings** — the gear button in the sidebar's bottom bar opens the
   settings dialog: base font size (UI and terminal scale together), the
   theme (light by default, dark available — covers the UI and the
@@ -55,9 +59,12 @@ and interact with each agent through an embedded terminal.
   can retry.
 
 Worktrees live under `~/.local/share/harmonium/worktrees/<repo>-<hash>/<branch>`;
-projects/agents persist in `~/.local/share/harmonium/state.json`. Agents without
-a live terminal (e.g. after restarting harmonium) offer a *Resume session*
-button that runs `claude --continue` in the agent's workdir.
+projects/agents persist in `~/.local/share/harmonium/state.json`. After
+restarting harmonium, an agent's terminals are restored lazily the first
+time it is selected: the agent session restarts with its preset's resume
+command in its workdir, and its shell tabs respawn with their saved
+scrollback. If a session exits or fails to spawn, a *Resume session*
+button restarts it.
 
 ## Keyboard & mouse
 
@@ -79,6 +86,7 @@ button that runs `claude --continue` in the agent's workdir.
 | --- | --- | --- |
 | `HARMONIUM_AGENT_BIN` | – | Overrides the preset command entirely (testing) |
 | `HARMONIUM_PLANNER_CMD` | `claude -p --model haiku` | Planner command line; the planning prompt is appended as the last argument. Haiku is the default because planning is a tiny classification task — a `claude -p` call boots a full Claude Code session (~15–19K tokens of scaffolding), which costs ~$0.14 on a premium model but ~$0.003 on haiku with a warm prompt cache. |
+| `HARMONIUM_PLANNER_MODEL` | `haiku` | Sets just the planner's `--model`, keeping the default `claude -p` command. Mutually exclusive with `HARMONIUM_PLANNER_CMD` — setting both is an error. |
 | `HARMONIUM_DATA_DIR` | `~/.local/share/harmonium` | State + worktrees |
 | `HARMONIUM_TERMINAL_FONT` | `DejaVu Sans Mono` | Terminal font family |
 | `HARMONIUM_UI_FONT` | `DejaVu Sans` | UI font family |
@@ -204,6 +212,6 @@ src/
     view.rs        focusable view routing keys/scroll to the PTY
 ```
 
-Known limitations (v1): removing an agent leaves its worktree on disk,
-terminal selection does not auto-scroll past the viewport edge, the agent
-description is stored but not editable in the UI (only the name is).
+Known limitations (v1): removing an agent leaves its worktree on disk, and
+the agent description is stored but not editable in the UI (only the name
+is).

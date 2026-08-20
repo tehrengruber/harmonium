@@ -872,7 +872,7 @@ impl Render for TextInput {
             } else {
                 theme::border()
             })
-            .rounded_md()
+            .rounded_sm()
             .text_color(theme::fg())
             .child(TextElement { input: cx.entity() })
     }

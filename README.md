@@ -132,9 +132,10 @@ claude-isol -v $HARMONIUM_TASK_GIT_ROOT:$HARMONIUM_TASK_GIT_ROOT -- --continue
 
 Both shipped `claude-isol` presets (container and `--local` bubblewrap) do
 this out of the box; `-v` is repeatable and must come before the `--`, since
-everything after it goes to claude. Note that the defaults only apply to a
-fresh `state.json` — an existing install keeps its saved presets, so add the
-mount by hand in Settings ▸ Presets.
+everything after it goes to claude. They are only created when `claude-isol`
+is on `PATH`, and only for a fresh `state.json` — an existing install keeps
+its saved presets, so add the mount (or the presets themselves, if you
+installed `claude-isol` afterwards) by hand in Settings ▸ Presets.
 
 Details worth knowing:
 

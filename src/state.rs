@@ -87,6 +87,39 @@ pub struct PresetRecord {
     pub env: String,
 }
 
+/// Whether `program` could actually be exec'd. Agent commands are exec'd
+/// directly, without a shell, so this mirrors what the spawn will do: a name
+/// is looked up in `PATH`, anything containing a `/` is taken as a path (`~`
+/// included — nothing would expand it, so such a command genuinely can't run).
+/// Only consulted when seeding defaults; saved presets are the user's list and
+/// are never second-guessed.
+fn program_available(program: &str) -> bool {
+    fn executable(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+
+    if program.is_empty() {
+        return false;
+    }
+    if program.contains('/') {
+        return executable(Path::new(program));
+    }
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+    path.split(':')
+        .filter(|dir| !dir.is_empty())
+        .any(|dir| executable(&Path::new(dir).join(program)))
+}
+
+/// The presets a fresh install starts with. The sandboxed ones are only
+/// created when `claude-isol` is actually installed: a preset that can't be
+/// exec'd is a spawn failure waiting to happen, and most machines don't have
+/// it. This is a one-time seeding decision — installing `claude-isol` later
+/// doesn't retro-add them, since persisted presets are the user's own list.
 pub fn default_presets() -> Vec<PresetRecord> {
     // The isolated presets mount the main repository at its own path: an
     // agent's workdir is usually a worktree whose `.git` is a file pointing
@@ -95,26 +128,27 @@ pub fn default_presets() -> Vec<PresetRecord> {
     // modes (bubblewrap translates it to a bind), and it must come before the
     // `--` separator — everything after that goes to claude.
     const MOUNT_GIT_ROOT: &str = "-v $HARMONIUM_TASK_GIT_ROOT:$HARMONIUM_TASK_GIT_ROOT";
-    vec![
-        PresetRecord {
-            name: "claude-code".into(),
-            command: "claude".into(),
-            resume_command: "claude --continue".into(),
-            env: String::new(),
-        },
-        PresetRecord {
+    let mut presets = vec![PresetRecord {
+        name: "claude-code".into(),
+        command: "claude".into(),
+        resume_command: "claude --continue".into(),
+        env: String::new(),
+    }];
+    if program_available("claude-isol") {
+        presets.push(PresetRecord {
             name: "claude-code isolated bubblewrap".into(),
             command: format!("claude-isol --local {MOUNT_GIT_ROOT}"),
             resume_command: format!("claude-isol --local {MOUNT_GIT_ROOT} -- --continue"),
             env: String::new(),
-        },
-        PresetRecord {
+        });
+        presets.push(PresetRecord {
             name: "claude-code isolated container".into(),
             command: format!("claude-isol {MOUNT_GIT_ROOT}"),
             resume_command: format!("claude-isol {MOUNT_GIT_ROOT} -- --continue"),
             env: String::new(),
-        },
-    ]
+        });
+    }
+    presets
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -236,4 +270,35 @@ pub fn save_state(state: &AppState) -> Result<()> {
     let json = serde_json::to_string_pretty(state)?;
     std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn program_availability_matches_what_exec_would_find() {
+        assert!(program_available("sh"));
+        assert!(program_available("/bin/sh"));
+        assert!(!program_available("harmonium-no-such-program"));
+        assert!(!program_available("/bin/harmonium-no-such-program"));
+        assert!(!program_available(""));
+        // A directory is not something exec can run.
+        assert!(!program_available("/bin"));
+        // `~` is never expanded for a directly exec'd command.
+        assert!(!program_available("~/bin/sh"));
+    }
+
+    #[test]
+    fn isolated_presets_only_created_when_installed() {
+        let isolated = default_presets()
+            .iter()
+            .filter(|preset| preset.command.starts_with("claude-isol"))
+            .count();
+        let expected = if program_available("claude-isol") { 2 } else { 0 };
+        assert_eq!(isolated, expected);
+        // The plain preset is always there.
+        assert!(default_presets().iter().any(|preset| preset.command == "claude"));
+    }
 }

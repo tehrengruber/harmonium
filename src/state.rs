@@ -22,6 +22,11 @@ pub struct AgentRecord {
     /// Command line used to resume this agent's session.
     #[serde(default)]
     pub resume_command: Option<String>,
+    /// `KEY=value` words from the preset, given to every process started for
+    /// this agent. Snapshotted at spawn like the commands above, so editing a
+    /// preset doesn't change the environment of agents already spawned from it.
+    #[serde(default)]
+    pub env: Option<String>,
     /// Extra terminal tabs opened next to the agent tab. Persisted so the
     /// same tabs reappear after a restart; each restarts as a fresh shell
     /// in the agent's workdir.
@@ -66,7 +71,7 @@ impl ProjectRecord {
 }
 
 /// A named agent command configuration selectable when spawning a task.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct PresetRecord {
     pub name: String,
     /// Command line used to spawn the agent; the task text is appended as
@@ -74,6 +79,12 @@ pub struct PresetRecord {
     pub command: String,
     /// Command line used to resume the agent's session in its workdir.
     pub resume_command: String,
+    /// Environment for the agent's processes, written as shell-style
+    /// `KEY=value` words (`FOO=bar BAZ="a b"`). Applies to the agent session,
+    /// its resumes and its shell tabs, unlike a `KEY=value` prefix on
+    /// `command`, which only reaches the process that command starts.
+    #[serde(default)]
+    pub env: String,
 }
 
 pub fn default_presets() -> Vec<PresetRecord> {
@@ -89,16 +100,19 @@ pub fn default_presets() -> Vec<PresetRecord> {
             name: "claude-code".into(),
             command: "claude".into(),
             resume_command: "claude --continue".into(),
+            env: String::new(),
         },
         PresetRecord {
             name: "claude-code isolated bubblewrap".into(),
             command: format!("claude-isol --local {MOUNT_GIT_ROOT}"),
             resume_command: format!("claude-isol --local {MOUNT_GIT_ROOT} -- --continue"),
+            env: String::new(),
         },
         PresetRecord {
             name: "claude-code isolated container".into(),
             command: format!("claude-isol {MOUNT_GIT_ROOT}"),
             resume_command: format!("claude-isol {MOUNT_GIT_ROOT} -- --continue"),
+            env: String::new(),
         },
     ]
 }
@@ -223,4 +237,3 @@ pub fn save_state(state: &AppState) -> Result<()> {
     std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
-

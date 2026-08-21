@@ -15,7 +15,8 @@ use crate::input::{InputEvent, TextInput};
 use crate::log;
 use crate::planner;
 use crate::state::{
-    load_state, save_state, AgentId, AgentRecord, AppState, ProjectRecord, TerminalTabRecord,
+    load_state, save_state, AgentId, AgentRecord, AppState, PresetRecord, ProjectRecord,
+    TerminalTabRecord,
 };
 use crate::state;
 use crate::terminal::view::TerminalView;
@@ -26,6 +27,7 @@ struct PresetInputs {
     name: Entity<TextInput>,
     command: Entity<TextInput>,
     resume_command: Entity<TextInput>,
+    env: Entity<TextInput>,
 }
 
 enum Dialog {
@@ -202,7 +204,8 @@ impl Workspace {
         self.persist(cx);
     }
 
-    /// The `HARMONIUM_TASK_*` environment for a saved agent, resolved from
+    /// The environment for a saved agent's processes: the `HARMONIUM_TASK_*`
+    /// variables followed by the preset's own `KEY=value` words. Resolved from
     /// state at spawn time so resume and lazy restore see the same values as
     /// the first spawn — including the owning project's path, which the agent
     /// record doesn't store.
@@ -213,7 +216,12 @@ impl Workspace {
         let Some(record) = project.agents.iter().find(|a| &a.id == id) else {
             return Vec::new();
         };
-        task_env(&project.path, &record.workdir, record.branch.as_deref())
+        let mut env = task_env(&project.path, &record.workdir, record.branch.as_deref());
+        // Appended, so a preset variable overrides a task variable of the same
+        // name — the same precedence a `KEY=value` command prefix has.
+        let preset_env = parse_env(record.env.as_deref().unwrap_or_default(), &env);
+        env.extend(preset_env);
+        env
     }
 
     /// Respawn the live processes for a saved agent: the agent session with
@@ -256,9 +264,10 @@ impl Workspace {
     }
 
     /// Spawn a shell tab, replaying any saved history file into the PTY first.
-    /// Shell tabs get the same `HARMONIUM_TASK_*` environment as the agent —
-    /// a shell sitting in the agent's workdir wants the same mounts and paths
-    /// — but no `$VAR` expansion: their command line isn't user-configured.
+    /// Shell tabs get the same environment as the agent — the `HARMONIUM_TASK_*`
+    /// variables and the preset's own, since a shell sitting in the agent's
+    /// workdir wants the same mounts, paths and settings — but no `$VAR`
+    /// expansion: their command line isn't user-configured.
     fn start_shell_tab(
         &mut self,
         id: &str,
@@ -760,9 +769,7 @@ impl Workspace {
 
     fn make_preset_inputs(
         &mut self,
-        name: &str,
-        command: &str,
-        resume_command: &str,
+        preset: &PresetRecord,
         subscriptions: &mut Vec<Subscription>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -788,9 +795,10 @@ impl Workspace {
             input
         };
         PresetInputs {
-            name: make("Preset name", name),
-            command: make("Command (task appended)", command),
-            resume_command: make("Resume command", resume_command),
+            name: make("Preset name", &preset.name),
+            command: make("Command (task appended)", &preset.command),
+            resume_command: make("Resume command", &preset.resume_command),
+            env: make("KEY=value KEY2=value2", &preset.env),
         }
     }
 
@@ -799,16 +807,7 @@ impl Workspace {
         let mut subscriptions = Vec::new();
         let preset_inputs: Vec<PresetInputs> = presets
             .iter()
-            .map(|p| {
-                self.make_preset_inputs(
-                    &p.name,
-                    &p.command,
-                    &p.resume_command,
-                    &mut subscriptions,
-                    window,
-                    cx,
-                )
-            })
+            .map(|p| self.make_preset_inputs(p, &mut subscriptions, window, cx))
             .collect();
         // The dialog is modal, so it has to take the keyboard: without this
         // the terminal keeps focus and typing goes into the PTY behind the
@@ -862,7 +861,8 @@ impl Workspace {
 
     fn add_preset_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut subscriptions = Vec::new();
-        let inputs = self.make_preset_inputs("", "", "", &mut subscriptions, window, cx);
+        let inputs =
+            self.make_preset_inputs(&PresetRecord::default(), &mut subscriptions, window, cx);
         // Typing should land in the row that was just added.
         window.focus(&inputs.name.focus_handle(cx));
         if let Some(Dialog::Settings {
@@ -924,6 +924,7 @@ impl Workspace {
                 let command = inputs.command.read(cx).text().trim().to_string();
                 let resume_command =
                     inputs.resume_command.read(cx).text().trim().to_string();
+                let env = inputs.env.read(cx).text().trim().to_string();
                 if name.is_empty() && command.is_empty() {
                     return None;
                 }
@@ -931,6 +932,7 @@ impl Workspace {
                     name: if name.is_empty() { command.clone() } else { name },
                     command,
                     resume_command,
+                    env,
                 })
             })
             .collect();
@@ -987,13 +989,18 @@ impl Workspace {
         } else {
             preset_index = self.state.settings.last_preset;
         }
-        let (command, resume_command) = self
+        let preset = self
             .state
             .settings
             .presets
             .get(preset_index)
-            .map(|p| (p.command.clone(), p.resume_command.clone()))
-            .unwrap_or_else(|| ("claude".into(), "claude --continue".into()));
+            .cloned()
+            .unwrap_or_else(|| PresetRecord {
+                name: "claude".into(),
+                command: "claude".into(),
+                resume_command: "claude --continue".into(),
+                env: String::new(),
+            });
         self.state.settings.last_preset = preset_index;
         self.persist(cx);
         cx.notify();
@@ -1019,15 +1026,7 @@ impl Workspace {
                 match result {
                     Ok(workspace) => {
                         this.dialog = None;
-                        this.finish_spawn(
-                            repo,
-                            task,
-                            workspace,
-                            command,
-                            resume_command,
-                            window,
-                            cx,
-                        );
+                        this.finish_spawn(repo, task, workspace, preset, window, cx);
                     }
                     Err(spawn_error) => {
                         // Keep the dialog open so the task text isn't lost;
@@ -1056,20 +1055,21 @@ impl Workspace {
         project_path: PathBuf,
         task: String,
         workspace: planner::Workspace,
-        command: String,
-        resume_command: String,
+        preset: PresetRecord,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let id = uuid::Uuid::new_v4().to_string();
+        let command = preset.command.clone();
         let record = AgentRecord {
             id: id.clone(),
             name: workspace.agent_name.clone(),
             description: task.clone(),
             workdir: workspace.workdir.clone(),
             branch: workspace.branch.clone(),
-            command: Some(command.clone()),
-            resume_command: Some(resume_command),
+            command: Some(preset.command),
+            resume_command: Some(preset.resume_command),
+            env: Some(preset.env),
             terminals: Vec::new(),
         };
         let Some(project) = self
@@ -1206,8 +1206,9 @@ impl Workspace {
         // Leading `KEY=value` words are environment for the child, as in a
         // shell — e.g. `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude`, which
         // keeps the agent's output in the scrollback where it can be scrolled
-        // and selected. They are appended after the task env, so an explicit
-        // assignment overrides a `HARMONIUM_TASK_*` variable of the same name.
+        // and selected. They are appended last, so an explicit assignment
+        // overrides a task or preset variable of the same name — and unlike the
+        // preset's env field, it reaches only this process, not the shell tabs.
         let mut env = task_env.clone();
         while let Some((name, value)) = parts.first().and_then(|word| split_assignment(word)) {
             env.push((name, expand_vars(&value, &task_env)));
@@ -2613,6 +2614,14 @@ impl Workspace {
                                     .child(
                                         div().flex_1().child(inputs.resume_command.clone()),
                                     ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(label("Env"))
+                                    .child(div().flex_1().child(inputs.env.clone())),
                             ),
                     );
                 }
@@ -2681,7 +2690,7 @@ impl Workspace {
                                 div()
                                     .text_color(theme::fg_dim())
                                     .text_xs()
-                                    .child("The task description is appended to the command. Use claude-isol for sandboxed runs (github.com/tehrengruber/claude-container-isolation)."),
+                                    .child("The task description is appended to the command. Env holds KEY=value words given to the agent, its resumes and its shell tabs. Use claude-isol for sandboxed runs (github.com/tehrengruber/claude-container-isolation)."),
                             )
                             .child(preset_list)
                             .child(
@@ -2763,6 +2772,31 @@ impl Workspace {
 fn split_assignment(word: &str) -> Option<(String, String)> {
     let (name, value) = word.split_once('=')?;
     is_var_name(name).then(|| (name.to_string(), value.to_string()))
+}
+
+/// Parse a preset's environment field — shell-style `KEY=value` words, quoted
+/// like a command line so a value may contain spaces. Values are expanded
+/// against `vars` and against everything assigned earlier in the same field,
+/// so one entry can build on another.
+///
+/// Words that aren't assignments are dropped with a log line: the field has no
+/// other meaning, and silently exec'ing something because of a stray word would
+/// be worse than ignoring it.
+fn parse_env(text: &str, vars: &[(String, String)]) -> Vec<(String, String)> {
+    let mut parsed: Vec<(String, String)> = Vec::new();
+    for word in planner::split_command(text) {
+        match split_assignment(&word) {
+            Some((name, value)) => {
+                let mut scope = vars.to_vec();
+                scope.extend(parsed.iter().cloned());
+                parsed.push((name, expand_vars(&value, &scope)));
+            }
+            None => log::error(format!(
+                "preset environment: ignoring `{word}`, expected KEY=value"
+            )),
+        }
+    }
+    parsed
 }
 
 fn is_var_name(name: &str) -> bool {
@@ -3057,6 +3091,35 @@ mod tests {
         );
         assert_eq!(expand_vars("cost: 5$", &vars), "cost: 5$");
         assert_eq!(expand_vars("$$HOME", &vars), "$HOME");
+    }
+
+    #[test]
+    fn preset_env_is_parsed_and_expanded() {
+        let vars = vars();
+        assert_eq!(
+            parse_env(
+                "FOO=bar CLAUDE_CONFIG_DIR=$HARMONIUM_TASK_WORKDIR/.claude",
+                &vars
+            ),
+            vec![
+                ("FOO".to_string(), "bar".to_string()),
+                (
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    "/data/worktrees/fix-login/.claude".to_string()
+                ),
+            ]
+        );
+        // Quoted values keep their spaces, and later entries see earlier ones.
+        assert_eq!(
+            parse_env("GREETING=\"hello there\" LOUD=$GREETING!", &vars),
+            vec![
+                ("GREETING".to_string(), "hello there".to_string()),
+                ("LOUD".to_string(), "hello there!".to_string()),
+            ]
+        );
+        // Non-assignments are dropped rather than silently becoming something.
+        assert_eq!(parse_env("claude --continue", &vars), Vec::new());
+        assert_eq!(parse_env("", &vars), Vec::new());
     }
 
     #[test]

@@ -18,7 +18,7 @@ worktree, a fresh kebab-case branch off the default branch, or the project's
 base checkout — and to name the agent (`#<PR number> <summary>` for PR work,
 open PRs come from `gh pr list` when available). The preset's command then
 runs there in an embedded PTY with the task appended as its last argument. A
-preset is a named pair of spawn and resume command lines; the defaults cover
+preset is a named spawn command, resume command and environment; the defaults cover
 plain `claude` plus the sandboxed
 [claude-isol](https://github.com/tehrengruber/claude-container-isolation)
 variants. If planning fails, the error is shown in the dialog and no agent or
@@ -70,14 +70,35 @@ for that run**, which is handy for one-off experiments.
 | `HARMONIUM_DATA_DIR` | – | `~/.local/share/harmonium` | State + worktrees. Env-only: it decides where `state.json` itself lives. |
 | `HARMONIUM_AGENT_BIN` | – | – | Replaces the preset command entirely (testing). Env-only. |
 
-An agent preset command may start with shell-style `KEY=value` words, which
-become environment for that agent's process:
+### Preset environment
+
+A preset has an **Env** field: shell-style `KEY=value` words, quoted like a
+command line so a value may contain spaces.
+
+```
+CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 CLAUDE_CONFIG_DIR="$HARMONIUM_TASK_WORKDIR/.claude"
+```
+
+Those variables reach **every** process harmonium starts for an agent spawned
+from that preset — the agent session, each resume, and the agent's shell tabs.
+Values may reference the task variables below (and harmonium's own
+environment), and an entry may reference one assigned earlier in the same
+field. Like the commands, the field is snapshotted onto the agent at spawn
+time, so editing a preset later doesn't change the environment of agents
+already spawned from it. Words that aren't `KEY=value` are ignored and logged.
+
+A preset *command* may also start with `KEY=value` words, as in a shell:
 
 ```
 CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude
 ```
 
-That one is worth knowing about: the claude CLI normally runs on the
+The difference is reach — a prefix applies only to the process that command
+starts, so it has to be repeated in the resume command and never reaches the
+shell tabs — and precedence: a prefix wins over an Env entry of the same name,
+which in turn wins over a task variable.
+
+That first variable is worth knowing about: the claude CLI normally runs on the
 *alternate screen*, where the transcript belongs to the program, which drives
 scrolling and selection through mouse reporting (works out of the box). Set
 the variable to have the agent render inline instead, so its output lands in
@@ -117,16 +138,18 @@ mount by hand in Settings ▸ Presets.
 
 Details worth knowing:
 
-- Expansion looks at the task variables first, then harmonium's own
-  environment, so `$HOME` and friends work too.
+- Expansion looks at the task variables first, then the preset's own Env
+  entries, then harmonium's environment — so `$HOME` and friends work too, and
+  a command can reuse a value defined once in Env.
 - **Unknown names are left literal.** A mistyped `$HARMONIUM_TASK_GITROOT`
   reaches the program as written instead of expanding to nothing and quietly
   producing `-v :/repo`. Write `$$` for a literal `$`.
 - Expansion happens per word *after* the command is split, so a path
   containing spaces stays a single argument; and per spawn against current
   values, so `state.json` keeps the unexpanded command and stays portable.
-- A `KEY=value` prefix wins over a task variable of the same name, e.g.
-  `HARMONIUM_TASK_GIT_ROOT=/elsewhere claude-isol …`.
+- A `KEY=value` prefix wins over a preset Env entry, which wins over a task
+  variable of the same name, e.g. `HARMONIUM_TASK_GIT_ROOT=/elsewhere
+  claude-isol …`.
 
 ## Building
 

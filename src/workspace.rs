@@ -6,12 +6,13 @@ use std::path::{Path, PathBuf};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, svg, App, AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    div, px, svg, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render, ScrollHandle,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
 };
 
 use crate::input::{InputEvent, TextInput};
+use crate::log;
 use crate::planner;
 use crate::state::{
     load_state, save_state, AgentId, AgentRecord, AppState, ProjectRecord, TerminalTabRecord,
@@ -51,6 +52,57 @@ enum Dialog {
 
 const MIN_SIDEBAR_WIDTH: f32 = 180.;
 const MAX_SIDEBAR_WIDTH: f32 = 600.;
+
+/// Sidebar/tab drag payloads. Each is its own type so gpui only offers a
+/// drop to rows of the same kind.
+#[derive(Clone)]
+struct ProjectDrag {
+    index: usize,
+}
+
+#[derive(Clone)]
+struct AgentDrag {
+    /// Reordering is within one project: an agent's worktree belongs to its
+    /// repository, so a drop onto another project's rows is ignored.
+    project: usize,
+    id: AgentId,
+}
+
+#[derive(Clone)]
+struct TabDrag {
+    agent: AgentId,
+    id: String,
+}
+
+/// gpui wants a view for the item under the pointer, but the drop is
+/// previewed by reordering the list in place, so this renders nothing.
+struct DragGhost;
+
+impl Render for DragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// The move a hovering drag would make, applied to the rendered order so the
+/// list shows its final state before the drop.
+#[derive(Clone, PartialEq)]
+enum DragTarget {
+    Project {
+        from: usize,
+        to: usize,
+    },
+    Agent {
+        project_index: usize,
+        from: AgentId,
+        to: AgentId,
+    },
+    Tab {
+        agent: AgentId,
+        from: String,
+        to: String,
+    },
+}
 
 /// A resolved command line for a terminal: the program to exec, its
 /// arguments, and any `KEY=value` prefixes that came with it.
@@ -92,6 +144,14 @@ pub struct Workspace {
     inline_edit: Option<InlineEdit>,
     resizing_sidebar: bool,
     status: Option<(String, bool)>,
+    /// Pending drag, previewed in the list until the drop lands.
+    drag_target: Option<DragTarget>,
+    /// Scroll position of the log panel, so new output can pin to the bottom.
+    log_scroll: ScrollHandle,
+    /// Log version last rendered, and the task polling for more output while
+    /// the panel is open.
+    log_version: usize,
+    log_task: Option<Task<()>>,
     focus_handle: FocusHandle,
 }
 
@@ -103,7 +163,7 @@ impl Workspace {
         });
         theme::set_mode(state.settings.theme);
         theme::set_fonts(&state.settings.ui_font, &state.settings.terminal_font);
-        let workspace = Self {
+        let mut workspace = Self {
             state,
             terminals: HashMap::new(),
             terminal_subscriptions: HashMap::new(),
@@ -115,8 +175,15 @@ impl Workspace {
             inline_edit: None,
             resizing_sidebar: false,
             status: None,
+            drag_target: None,
+            log_scroll: ScrollHandle::new(),
+            log_version: log::version(),
+            log_task: None,
             focus_handle: cx.focus_handle(),
         };
+        if workspace.state.settings.log_panel_open {
+            workspace.start_log_polling(cx);
+        }
         cx.on_app_quit(|this, cx| {
             this.persist(cx);
             std::future::ready(())
@@ -232,8 +299,161 @@ impl Workspace {
     }
 
     fn set_status(&mut self, message: String, is_error: bool, cx: &mut Context<Self>) {
+        if is_error {
+            log::error(message.clone());
+        } else {
+            log::info(message.clone());
+        }
         self.status = Some((message, is_error));
         cx.notify();
+    }
+
+    // ---- Log panel ----
+
+    fn toggle_log_panel(&mut self, cx: &mut Context<Self>) {
+        let open = !self.state.settings.log_panel_open;
+        self.state.settings.log_panel_open = open;
+        if open {
+            self.log_scroll.scroll_to_bottom();
+            self.start_log_polling(cx);
+        } else {
+            self.log_task = None;
+        }
+        self.persist(cx);
+        cx.notify();
+    }
+
+    /// Writers to the log have no handle to the UI, so while the panel is
+    /// open we poll its version and repaint when it changes.
+    fn start_log_polling(&mut self, cx: &mut Context<Self>) {
+        self.log_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(400))
+                    .await;
+                let keep_polling = this
+                    .update(cx, |this, cx| {
+                        if !this.state.settings.log_panel_open {
+                            return false;
+                        }
+                        let version = log::version();
+                        if version != this.log_version {
+                            this.log_version = version;
+                            this.log_scroll.scroll_to_bottom();
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_polling {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn render_log_panel(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        let entries = log::entries();
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .p_2()
+            .font_family(theme::terminal_font().family.clone())
+            .text_size(px(theme::base_font_size(cx) - 1.));
+        if entries.is_empty() {
+            list = list.child(
+                div()
+                    .text_color(theme::fg_dim())
+                    .child("Nothing logged yet."),
+            );
+        }
+        for entry in entries {
+            let color = match entry.level {
+                log::Level::Error => theme::error(),
+                log::Level::Info => theme::fg(),
+            };
+            list = list.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_start()
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme::fg_dim())
+                            .child(SharedString::from(entry.time)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(color)
+                            .child(SharedString::from(entry.message)),
+                    ),
+            );
+        }
+
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .text_xs()
+                .text_color(theme::fg_dim())
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::hover_bg()).text_color(theme::fg()))
+                .child(label)
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .h(px(180.))
+            .bg(theme::panel_bg())
+            .border_t_1()
+            .border_color(theme::border())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(theme::border())
+                    .child(div().text_color(theme::fg_dim()).text_xs().child("Log"))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(button("log-clear", "Clear").on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    log::clear();
+                                    this.log_version = log::version();
+                                    cx.notify();
+                                },
+                            )))
+                            .child(button("log-close", "×").on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.toggle_log_panel(cx);
+                                },
+                            ))),
+                    ),
+            )
+            .child(
+                div()
+                    .id("log-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.log_scroll)
+                    .child(list),
+            )
+            .into_any_element()
     }
 
     // ---- Projects ----
@@ -289,6 +509,7 @@ impl Workspace {
             self.set_status("Project already added".into(), true, cx);
             return;
         }
+        log::info(format!("project added: {}", path.display()));
         self.state.projects.push(ProjectRecord::new(path));
         self.dialog = None;
         self.status = None;
@@ -306,6 +527,130 @@ impl Workspace {
                 agent.terminals.iter().map(|t| t.id.clone()).collect();
             self.teardown_agent(&agent.id, &tab_ids, cx);
         }
+        self.persist(cx);
+        cx.notify();
+    }
+
+    // ---- Reordering ----
+
+    /// Move `from` to sit where `to` currently is, the usual list-drag
+    /// behaviour. Returns the moved element's new index.
+    fn reorder<T>(items: &mut Vec<T>, from: usize, to: usize) {
+        if from == to || from >= items.len() || to >= items.len() {
+            return;
+        }
+        let item = items.remove(from);
+        items.insert(to, item);
+    }
+
+    /// A drag only tracks the axis it moves along: leaving the row sideways —
+    /// out of the sidebar, or below the tab bar — should not stop the list
+    /// from following the pointer.
+    fn spans_row(bounds: Bounds<Pixels>, position: Point<Pixels>) -> bool {
+        position.y >= bounds.origin.y && position.y < bounds.origin.y + bounds.size.height
+    }
+
+    fn spans_column(bounds: Bounds<Pixels>, position: Point<Pixels>) -> bool {
+        position.x >= bounds.origin.x && position.x < bounds.origin.x + bounds.size.width
+    }
+
+    /// A row/tab claims the drag once the pointer is past its middle, rather
+    /// than clear of it: half a row of travel is enough to land in the slot,
+    /// and the remaining half is the hysteresis that stops it oscillating.
+    fn past_middle(shown_before: bool, middle: Pixels, position: Pixels) -> bool {
+        if shown_before {
+            position <= middle
+        } else {
+            position >= middle
+        }
+    }
+
+    /// Whether `hovered` currently renders before `dragged` — which half of
+    /// the hovered row counts depends on the direction of travel, and the
+    /// preview, not the stored order, is what the user sees.
+    fn shown_before(
+        len: usize,
+        pending: Option<(usize, usize)>,
+        hovered: usize,
+        dragged: usize,
+    ) -> bool {
+        let order = Self::preview_order(len, pending.map(|p| p.0), pending.map(|p| p.1));
+        let position = |item: usize| order.iter().position(|&i| i == item).unwrap_or(item);
+        position(hovered) < position(dragged)
+    }
+
+    /// Display order for a list of `len` items with the pending move applied,
+    /// as indices into the real list.
+    fn preview_order(len: usize, from: Option<usize>, to: Option<usize>) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..len).collect();
+        if let (Some(from), Some(to)) = (from, to) {
+            Self::reorder(&mut order, from, to);
+        }
+        order
+    }
+
+    /// Commit the previewed move. The preview is authoritative: once the list
+    /// has reordered on screen the row under the pointer is the dragged item
+    /// itself, so recomputing from the drop target would be a no-op.
+    fn apply_drag_target(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(target) = self.drag_target.clone() else {
+            return false;
+        };
+        match target {
+            DragTarget::Project { from, to } => self.move_project(from, to, cx),
+            DragTarget::Agent {
+                project_index,
+                from,
+                to,
+            } => self.move_agent(project_index, &from, &to, cx),
+            DragTarget::Tab { agent, from, to } => self.move_tab(&agent, &from, &to, cx),
+        }
+        true
+    }
+
+    fn set_drag_target(&mut self, target: DragTarget, cx: &mut Context<Self>) {
+        if self.drag_target.as_ref() != Some(&target) {
+            self.drag_target = Some(target);
+            cx.notify();
+        }
+    }
+
+    fn move_project(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        self.drag_target = None;
+        Self::reorder(&mut self.state.projects, from, to);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn move_agent(&mut self, project: usize, from: &AgentId, to: &AgentId, cx: &mut Context<Self>) {
+        self.drag_target = None;
+        let Some(agents) = self
+            .state
+            .projects
+            .get_mut(project)
+            .map(|project| &mut project.agents)
+        else {
+            return;
+        };
+        let index = |id: &AgentId| agents.iter().position(|agent| &agent.id == id);
+        let (Some(from), Some(to)) = (index(from), index(to)) else {
+            return;
+        };
+        Self::reorder(agents, from, to);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn move_tab(&mut self, agent: &AgentId, from: &str, to: &str, cx: &mut Context<Self>) {
+        self.drag_target = None;
+        let Some(record) = self.state.agent_mut(agent) else {
+            return;
+        };
+        let index = |id: &str| record.terminals.iter().position(|tab| tab.id == id);
+        let (Some(from), Some(to)) = (index(from), index(to)) else {
+            return;
+        };
+        Self::reorder(&mut record.terminals, from, to);
         self.persist(cx);
         cx.notify();
     }
@@ -705,6 +1050,12 @@ impl Workspace {
             self.set_status("Project disappeared while planning".into(), true, cx);
             return;
         };
+        log::info(format!(
+            "agent {}: created on {} in {}",
+            workspace.agent_name,
+            workspace.branch.as_deref().unwrap_or("the base checkout"),
+            workspace.workdir.display()
+        ));
         project.agents.push(record);
         project.expanded = true;
         self.persist(cx);
@@ -819,6 +1170,12 @@ impl Workspace {
         persist_history: bool,
         cx: &mut Context<Self>,
     ) {
+        log::info(format!(
+            "terminal {id}: spawning `{} {}` in {}",
+            spawn.program,
+            spawn.args.join(" "),
+            workdir.display()
+        ));
         match Terminal::create(
             id.to_string(),
             spawn.program,
@@ -839,6 +1196,9 @@ impl Workspace {
                         // Plain output already redraws the terminal view
                         // itself; only title/exit change what the workspace
                         // chrome renders.
+                        if matches!(event, TerminalEvent::Exited) {
+                            log::info(format!("terminal {terminal_id}: process exited"));
+                        }
                         if !matches!(event, TerminalEvent::Output) {
                             cx.notify();
                         }
@@ -895,6 +1255,7 @@ impl Workspace {
             .resume_command
             .clone()
             .unwrap_or_else(|| "claude --continue".into());
+        log::info(format!("agent {}: resuming with `{resume}`", record.name));
         self.start_agent_terminal(&id, resume, Vec::new(), workdir.clone(), cx);
         if !self.terminals.contains_key(&id) {
             // The respawn failed; without the snapshot dropped, the "No live
@@ -946,6 +1307,9 @@ impl Workspace {
     }
 
     fn remove_agent(&mut self, id: AgentId, cx: &mut Context<Self>) {
+        if let Some(record) = self.state.agent(&id) {
+            log::info(format!("agent {}: removed", record.name));
+        }
         let tab_ids: Vec<String> = self
             .state
             .agent(&id)
@@ -1080,7 +1444,15 @@ impl Workspace {
             );
         }
 
-        for (project_index, project) in self.state.projects.iter().enumerate() {
+        let project_order = {
+            let (from, to) = match &self.drag_target {
+                Some(DragTarget::Project { from, to }) => (Some(*from), Some(*to)),
+                _ => (None, None),
+            };
+            Self::preview_order(self.state.projects.len(), from, to)
+        };
+        for project_index in project_order {
+            let project = &self.state.projects[project_index];
             let expanded = project.expanded;
             let project_path = project.path.clone();
 
@@ -1095,6 +1467,53 @@ impl Workspace {
                     .rounded_sm()
                     .cursor_pointer()
                     .hover(|s| s.bg(theme::hover_bg()))
+                    .on_drag(ProjectDrag { index: project_index }, |_, _, _, cx| {
+                        cx.new(|_| DragGhost)
+                    })
+                    .on_drag_move(cx.listener(
+                        move |this, event: &gpui::DragMoveEvent<ProjectDrag>, _, cx| {
+                            // gpui delivers drag moves to every listener of
+                            // this type, hovered or not, so the row has to
+                            // check for itself — on the drag axis only.
+                            if !Self::spans_row(event.bounds, event.event.position) {
+                                return;
+                            }
+                            let from = event.drag(cx).index;
+                            // Hovering the dragged row means "leave the
+                            // preview as it is"; treating it as a target
+                            // would flip the list back and forth.
+                            if from == project_index {
+                                return;
+                            }
+                            let pending = match &this.drag_target {
+                                Some(DragTarget::Project { from, to }) => Some((*from, *to)),
+                                _ => None,
+                            };
+                            let shown_before = Self::shown_before(
+                                this.state.projects.len(),
+                                pending,
+                                project_index,
+                                from,
+                            );
+                            let middle =
+                                event.bounds.origin.y + event.bounds.size.height / 2.;
+                            if !Self::past_middle(shown_before, middle, event.event.position.y) {
+                                return;
+                            }
+                            this.set_drag_target(
+                                DragTarget::Project {
+                                    from,
+                                    to: project_index,
+                                },
+                                cx,
+                            );
+                        },
+                    ))
+                    .on_drop(cx.listener(move |this, drag: &ProjectDrag, _, cx| {
+                        if !this.apply_drag_target(cx) {
+                            this.move_project(drag.index, project_index, cx);
+                        }
+                    }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(p) = this.state.projects.get_mut(project_index) {
                             p.expanded = !p.expanded;
@@ -1160,7 +1579,22 @@ impl Workspace {
                             .child("no agents"),
                     );
                 }
-                for (agent_index, agent) in project.agents.iter().enumerate() {
+                let agent_order = {
+                    let (from, to) = match &self.drag_target {
+                        Some(DragTarget::Agent {
+                            project_index: dragged_project,
+                            from,
+                            to,
+                        }) if *dragged_project == project_index => (
+                            project.agents.iter().position(|agent| &agent.id == from),
+                            project.agents.iter().position(|agent| &agent.id == to),
+                        ),
+                        _ => (None, None),
+                    };
+                    Self::preview_order(project.agents.len(), from, to)
+                };
+                for agent_index in agent_order {
+                    let agent = &project.agents[agent_index];
                     // Inline description editing initiated from the sidebar
                     // replaces the whole row with the input.
                     if let Some(edit) = self
@@ -1206,6 +1640,85 @@ impl Workspace {
                             .cursor_pointer()
                             .when(is_selected, |s| s.bg(theme::selected_bg()))
                             .hover(|s| s.bg(theme::hover_bg()))
+                            .on_drag(
+                                AgentDrag {
+                                    project: project_index,
+                                    id: agent.id.clone(),
+                                },
+                                |_, _, _, cx| cx.new(|_| DragGhost),
+                            )
+                            .on_drag_move(cx.listener({
+                                let target = agent.id.clone();
+                                move |this, event: &gpui::DragMoveEvent<AgentDrag>, _, cx| {
+                                    if !Self::spans_row(event.bounds, event.event.position) {
+                                        return;
+                                    }
+                                    let drag = event.drag(cx);
+                                    if drag.project != project_index {
+                                        return;
+                                    }
+                                    let from = drag.id.clone();
+                                    if from == target {
+                                        return;
+                                    }
+                                    let Some(agents) = this
+                                        .state
+                                        .projects
+                                        .get(project_index)
+                                        .map(|project| &project.agents)
+                                    else {
+                                        return;
+                                    };
+                                    let index = |id: &AgentId| {
+                                        agents.iter().position(|agent| &agent.id == id)
+                                    };
+                                    let (Some(hovered), Some(dragged)) =
+                                        (index(&target), index(&from))
+                                    else {
+                                        return;
+                                    };
+                                    let pending = match &this.drag_target {
+                                        Some(DragTarget::Agent { from, to, .. }) => {
+                                            index(from).zip(index(to))
+                                        }
+                                        _ => None,
+                                    };
+                                    let shown_before = Self::shown_before(
+                                        agents.len(),
+                                        pending,
+                                        hovered,
+                                        dragged,
+                                    );
+                                    let middle =
+                                        event.bounds.origin.y + event.bounds.size.height / 2.;
+                                    if !Self::past_middle(
+                                        shown_before,
+                                        middle,
+                                        event.event.position.y,
+                                    ) {
+                                        return;
+                                    }
+                                    this.set_drag_target(
+                                        DragTarget::Agent {
+                                            project_index,
+                                            from,
+                                            to: target.clone(),
+                                        },
+                                        cx,
+                                    );
+                                }
+                            }))
+                            .on_drop(cx.listener({
+                                let target = agent.id.clone();
+                                move |this, drag: &AgentDrag, _, cx| {
+                                    if this.apply_drag_target(cx) {
+                                        return;
+                                    }
+                                    if drag.project == project_index {
+                                        this.move_agent(project_index, &drag.id, &target, cx);
+                                    }
+                                }
+                            }))
                             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                                 if event.click_count() >= 2 {
                                     this.start_inline_edit(dbl_id.clone(), window, cx);
@@ -1352,6 +1865,30 @@ impl Workspace {
                     )
                     .child(
                         div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id("toggle-log")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .text_color(if self.state.settings.log_panel_open {
+                                        theme::accent()
+                                    } else {
+                                        theme::fg_dim()
+                                    })
+                                    .hover(|s| s.bg(theme::hover_bg()).text_color(theme::fg()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_log_panel(cx);
+                                    }))
+                                    .child("Log"),
+                            )
+                            .child(
+                        div()
                             .id("open-settings")
                             .px_2()
                             .py_0p5()
@@ -1363,6 +1900,7 @@ impl Workspace {
                                 this.open_settings_dialog(window, cx);
                             }))
                             .child("⚙"),
+                            ),
                     ),
             )
             .into_any_element()
@@ -1383,7 +1921,7 @@ impl Workspace {
             |id: &str,
              label: String,
              active: bool,
-             closable: bool,
+             shell_tab: bool,
              agent_id: AgentId,
              on_click: Box<dyn Fn(&mut Self, &ClickEvent, &mut Window, &mut Context<Self>) + 'static>,
              cx: &Context<Self>| {
@@ -1416,7 +1954,81 @@ impl Workspace {
                             .child(SharedString::from(label)),
                     );
 
-                if closable {
+                if shell_tab {
+                    // Only shell tabs move; the agent tab is the session
+                    // itself and stays first.
+                    let drag_agent = agent_id.clone();
+                    let drag_id = id.to_string();
+                    let drop_agent = agent_id.clone();
+                    let drop_id = id.to_string();
+                    let move_agent = agent_id.clone();
+                    let move_id = id.to_string();
+                    tab = tab
+                        .on_drag(
+                            TabDrag {
+                                agent: drag_agent,
+                                id: drag_id,
+                            },
+                            |_, _, _, cx| cx.new(|_| DragGhost),
+                        )
+                        .on_drag_move(cx.listener(
+                            move |this, event: &gpui::DragMoveEvent<TabDrag>, _, cx| {
+                                if !Self::spans_column(event.bounds, event.event.position) {
+                                    return;
+                                }
+                                let drag = event.drag(cx);
+                                if drag.agent != move_agent {
+                                    return;
+                                }
+                                if drag.id == move_id {
+                                    return;
+                                }
+                                let Some(record) = this.state.agent(&move_agent) else {
+                                    return;
+                                };
+                                let index = |id: &str| {
+                                    record.terminals.iter().position(|tab| tab.id == id)
+                                };
+                                let (Some(hovered), Some(dragged)) =
+                                    (index(&move_id), index(&drag.id))
+                                else {
+                                    return;
+                                };
+                                let pending = match &this.drag_target {
+                                    Some(DragTarget::Tab { from, to, .. }) => {
+                                        index(from).zip(index(to))
+                                    }
+                                    _ => None,
+                                };
+                                let shown_before = Self::shown_before(
+                                    record.terminals.len(),
+                                    pending,
+                                    hovered,
+                                    dragged,
+                                );
+                                let middle = event.bounds.origin.x + event.bounds.size.width / 2.;
+                                if !Self::past_middle(shown_before, middle, event.event.position.x)
+                                {
+                                    return;
+                                }
+                                this.set_drag_target(
+                                    DragTarget::Tab {
+                                        agent: move_agent.clone(),
+                                        from: drag.id.clone(),
+                                        to: move_id.clone(),
+                                    },
+                                    cx,
+                                );
+                            },
+                        ))
+                        .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
+                            if this.apply_drag_target(cx) {
+                                return;
+                            }
+                            if drag.agent == drop_agent {
+                                this.move_tab(&drop_agent, &drag.id, &drop_id, cx);
+                            }
+                        }));
                     tab = tab.child(
                         div()
                             .id(format!("close-{tab_id_for_close}"))
@@ -1455,8 +2067,23 @@ impl Workspace {
             cx,
         ));
 
-        // Extra terminal tabs.
-        for tab_record in &agent.terminals {
+        // Extra terminal tabs, in the order a hovering drag would leave them.
+        let tab_order = {
+            let (from, to) = match &self.drag_target {
+                Some(DragTarget::Tab {
+                    agent: dragged_agent,
+                    from,
+                    to,
+                }) if *dragged_agent == agent.id => (
+                    agent.terminals.iter().position(|tab| &tab.id == from),
+                    agent.terminals.iter().position(|tab| &tab.id == to),
+                ),
+                _ => (None, None),
+            };
+            Self::preview_order(agent.terminals.len(), from, to)
+        };
+        for tab_index in tab_order {
+            let tab_record = &agent.terminals[tab_index];
             let tab_id = tab_record.id.clone();
             let owner_id = agent.id.clone();
             row = row.child(tab(
@@ -1593,6 +2220,10 @@ impl Workspace {
                     );
                 }
             }
+        }
+
+        if self.state.settings.log_panel_open {
+            pane = pane.child(self.render_log_panel(cx));
         }
 
         if let Some((message, is_error)) = &self.status {
@@ -2093,6 +2724,13 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A release outside the list never reaches a drop handler, but the
+        // preview showed where the item would land, so commit it rather than
+        // snapping back.
+        if self.drag_target.is_some() && !cx.has_active_drag() {
+            self.apply_drag_target(cx);
+        }
+
         // Scale rem-based sizes (text_sm/text_xs etc.) with the base font
         // size; at the default size this yields the standard 16px rem.
         window.set_rem_size(px(

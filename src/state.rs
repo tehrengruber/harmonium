@@ -114,6 +114,8 @@ pub struct SettingsRecord {
     pub planner_model: String,
     pub terminal_font: String,
     pub ui_font: String,
+    /// Whether the log panel is showing under the terminal.
+    pub log_panel_open: bool,
 }
 
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 280.;
@@ -131,6 +133,7 @@ impl Default for SettingsRecord {
             planner_model: crate::planner::DEFAULT_MODEL.to_string(),
             terminal_font: crate::theme::DEFAULT_TERMINAL_FONT.to_string(),
             ui_font: crate::theme::DEFAULT_UI_FONT.to_string(),
+            log_panel_open: false,
         }
     }
 }

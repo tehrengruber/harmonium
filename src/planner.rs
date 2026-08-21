@@ -237,6 +237,7 @@ about an existing pull request, it MUST have the form "#<PR number> <2-4 word su
     if parts.is_empty() {
         bail!("empty planner command");
     }
+    crate::log::info(format!("planner: running `{command}` for task: {task}"));
     let program = parts.remove(0);
     let out = Command::new(&program)
         .args(&parts)
@@ -251,7 +252,10 @@ about an existing pull request, it MUST have the form "#<PR number> <2-4 word su
         bail!("planner failed: {}", snippet(message.trim()));
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    parse_plan_json(&text)
+    crate::log::info(format!("planner replied: {}", snippet(text.trim())));
+    let plan = parse_plan_json(&text)?;
+    crate::log::info(format!("planner plan: {plan:?}"));
+    Ok(plan)
 }
 
 /// The default planner command for a model name. A multi-word name would

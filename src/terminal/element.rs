@@ -490,6 +490,11 @@ impl Element for TerminalElement {
             if phase != DispatchPhase::Bubble {
                 return;
             }
+            // A tab or sidebar row being dragged across the terminal is not
+            // terminal input.
+            if cx.has_active_drag() {
+                return;
+            }
             // A drag that began as a selection stays one even if the program
             // turns tracking on midway.
             if !terminal.read(cx).selecting {

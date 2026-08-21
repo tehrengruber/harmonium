@@ -1,5 +1,6 @@
 mod assets;
 mod input;
+mod log;
 mod planner;
 mod state;
 mod terminal;

@@ -2907,6 +2907,10 @@ impl Render for Workspace {
 
         let mut root = div()
             .id("workspace")
+            // Key bindings with a context predicate only match against a
+            // non-empty context stack, so the root names itself — this is what
+            // makes `!TextInput` (ctrl-shift-t) resolvable at all.
+            .key_context("Workspace")
             .track_focus(&self.focus_handle)
             .relative()
             .flex()

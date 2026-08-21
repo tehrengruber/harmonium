@@ -8,11 +8,11 @@ mod theme;
 mod workspace;
 
 use gpui::{
-    actions, px, size, App, AppContext as _, Application, Bounds, KeyBinding, TitlebarOptions,
-    WindowBounds, WindowOptions,
+    actions, px, size, App, AppContext as _, Application, Bounds, KeyBinding, QuitMode,
+    TitlebarOptions, WindowBounds, WindowOptions,
 };
 
-actions!(harmonium, [Quit]);
+actions!(harmonium, [Quit, NewTerminalTab]);
 
 fn main() {
     env_logger::init();
@@ -37,9 +37,37 @@ fn main() {
         return;
     }
 
-    Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
+    // Closing the last window must not quit us from inside gpui's window
+    // teardown: on X11 that runs while the platform client's RefCell is
+    // borrowed for the event being handled, and `App::quit` re-enters it
+    // ("RefCell already borrowed"). Quitting is ours to do, one tick later.
+    let app = Application::new()
+        .with_assets(assets::Assets)
+        .with_quit_mode(QuitMode::Explicit);
+
+    app.run(|cx: &mut App| {
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.spawn(async move |cx| {
+                    cx.update(|cx| cx.quit()).ok();
+                })
+                .detach();
+            }
+        })
+        .detach();
+
         cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
+
+        // New shell tab for the selected agent, handled by the workspace.
+        // Key bindings are matched before any `on_key_down` listener, so this
+        // wins over the focused terminal's keyboard passthrough; excluding
+        // TextInput keeps it inert while a dialog field has the keyboard.
+        cx.bind_keys([KeyBinding::new(
+            "ctrl-shift-t",
+            NewTerminalTab,
+            Some("!TextInput"),
+        )]);
 
         // Text input editing keys, scoped to focused TextInput widgets.
         cx.bind_keys([

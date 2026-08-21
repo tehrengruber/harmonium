@@ -202,6 +202,20 @@ impl Workspace {
         self.persist(cx);
     }
 
+    /// The `HARMONIUM_TASK_*` environment for a saved agent, resolved from
+    /// state at spawn time so resume and lazy restore see the same values as
+    /// the first spawn — including the owning project's path, which the agent
+    /// record doesn't store.
+    fn agent_task_env(&self, id: &AgentId) -> Vec<(String, String)> {
+        let Some(project) = self.state.project_for_agent(id) else {
+            return Vec::new();
+        };
+        let Some(record) = project.agents.iter().find(|a| &a.id == id) else {
+            return Vec::new();
+        };
+        task_env(&project.path, &record.workdir, record.branch.as_deref())
+    }
+
     /// Respawn the live processes for a saved agent: the agent session with
     /// its stored resume command, plus one shell per saved tab replaying that
     /// tab's history. Done lazily on first selection rather than for every
@@ -219,13 +233,21 @@ impl Workspace {
             .resume_command
             .clone()
             .unwrap_or_else(|| "claude --continue".into());
+        let task_env = self.agent_task_env(id);
         if !self.terminals.contains_key(id) {
-            self.start_agent_terminal(id, resume, Vec::new(), record.workdir.clone(), cx);
+            self.start_agent_terminal(
+                id,
+                resume,
+                Vec::new(),
+                record.workdir.clone(),
+                task_env.clone(),
+                cx,
+            );
         }
         for tab in &record.terminals {
             // Guard against restoring a tab that was just spawned by hand.
             if !self.terminals.contains_key(&tab.id) {
-                self.start_shell_tab(&tab.id, &record.workdir, cx);
+                self.start_shell_tab(&tab.id, &record.workdir, task_env.clone(), cx);
             }
         }
         self.active_tabs
@@ -234,7 +256,16 @@ impl Workspace {
     }
 
     /// Spawn a shell tab, replaying any saved history file into the PTY first.
-    fn start_shell_tab(&mut self, id: &str, workdir: &Path, cx: &mut Context<Self>) {
+    /// Shell tabs get the same `HARMONIUM_TASK_*` environment as the agent —
+    /// a shell sitting in the agent's workdir wants the same mounts and paths
+    /// — but no `$VAR` expansion: their command line isn't user-configured.
+    fn start_shell_tab(
+        &mut self,
+        id: &str,
+        workdir: &Path,
+        task_env: Vec<(String, String)>,
+        cx: &mut Context<Self>,
+    ) {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let history_path = state::terminal_history_path(id);
         let (program, args) = if history_path.exists() {
@@ -262,7 +293,7 @@ impl Workspace {
         let spawn = Spawn {
             program,
             args,
-            env: Vec::new(),
+            env: task_env,
         };
         self.start_terminal(id, spawn, workdir.to_path_buf(), true, cx);
     }
@@ -1060,12 +1091,45 @@ impl Workspace {
         project.expanded = true;
         self.persist(cx);
 
-        self.start_agent_terminal(&id, command, vec![task], workspace.workdir, cx);
+        let task_env = self.agent_task_env(&id);
+        self.start_agent_terminal(&id, command, vec![task], workspace.workdir, task_env, cx);
         // A brand-new agent has nothing saved to restore.
         self.restored.insert(id.clone());
         self.active_tabs.insert(id.clone(), id.clone());
         self.status = None;
         self.select_agent(id, window, cx);
+    }
+
+    /// The `+` in the tab bar, and its ctrl-shift-t binding: append a
+    /// "Shell N" tab to an agent. No-op for an unknown agent.
+    fn add_next_shell_tab(
+        &mut self,
+        agent_id: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(next) = self
+            .state
+            .agent(&agent_id)
+            .map(|record| record.terminals.len() + 1)
+        else {
+            return;
+        };
+        self.add_terminal_tab(agent_id, format!("Shell {next}"), window, cx);
+    }
+
+    /// ctrl-shift-t. Nothing is selected before the first agent is opened, and
+    /// then there is no tab bar to add to either.
+    fn new_terminal_tab(
+        &mut self,
+        _: &crate::NewTerminalTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent_id) = self.selected.clone() else {
+            return;
+        };
+        self.add_next_shell_tab(agent_id, window, cx);
     }
 
     /// Spawn a fresh shell in the agent's workdir for a new terminal tab.
@@ -1080,7 +1144,8 @@ impl Workspace {
             return;
         };
         let tab_id = uuid::Uuid::new_v4().to_string();
-        self.start_shell_tab(&tab_id, &record.workdir, cx);
+        let task_env = self.agent_task_env(&agent_id);
+        self.start_shell_tab(&tab_id, &record.workdir, task_env, cx);
         if let Some(record) = self.state.agent_mut(&agent_id) {
             record.terminals.push(TerminalTabRecord {
                 id: tab_id.clone(),
@@ -1131,6 +1196,7 @@ impl Workspace {
         command: String,
         extra_args: Vec<String>,
         workdir: PathBuf,
+        task_env: Vec<(String, String)>,
         cx: &mut Context<Self>,
     ) {
         // Test/debug override: replaces the preset command entirely. Scoped
@@ -1140,11 +1206,17 @@ impl Workspace {
         // Leading `KEY=value` words are environment for the child, as in a
         // shell — e.g. `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude`, which
         // keeps the agent's output in the scrollback where it can be scrolled
-        // and selected.
-        let mut env = Vec::new();
-        while let Some(assignment) = parts.first().and_then(|word| split_assignment(word)) {
-            env.push(assignment);
+        // and selected. They are appended after the task env, so an explicit
+        // assignment overrides a `HARMONIUM_TASK_*` variable of the same name.
+        let mut env = task_env.clone();
+        while let Some((name, value)) = parts.first().and_then(|word| split_assignment(word)) {
+            env.push((name, expand_vars(&value, &task_env)));
             parts.remove(0);
+        }
+        // Expanded per spawn, word by word — the stored command keeps the
+        // unexpanded `$VAR`, and a value containing spaces stays one argument.
+        for part in &mut parts {
+            *part = expand_vars(part, &task_env);
         }
         if parts.is_empty() {
             self.set_status(format!("Empty agent command: `{command}`"), true, cx);
@@ -1256,7 +1328,8 @@ impl Workspace {
             .clone()
             .unwrap_or_else(|| "claude --continue".into());
         log::info(format!("agent {}: resuming with `{resume}`", record.name));
-        self.start_agent_terminal(&id, resume, Vec::new(), workdir.clone(), cx);
+        let task_env = self.agent_task_env(&id);
+        self.start_agent_terminal(&id, resume, Vec::new(), workdir.clone(), task_env.clone(), cx);
         if !self.terminals.contains_key(&id) {
             // The respawn failed; without the snapshot dropped, the "No live
             // session / Resume" UI would be unreachable for a retry.
@@ -1264,7 +1337,7 @@ impl Workspace {
         }
         // Restart persisted extra tabs, replaying the history just written.
         for tab in &record.terminals {
-            self.start_shell_tab(&tab.id, &workdir, cx);
+            self.start_shell_tab(&tab.id, &workdir, task_env.clone(), cx);
         }
         self.restored.insert(id.clone());
         self.active_tabs.insert(id.clone(), id.clone());
@@ -2110,17 +2183,7 @@ impl Workspace {
                 .text_color(theme::accent())
                 .hover(|s| s.bg(theme::hover_bg()))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    let next = this
-                        .state
-                        .agent(&add_agent_id)
-                        .map(|r| r.terminals.len() + 1)
-                        .unwrap_or(1);
-                    this.add_terminal_tab(
-                        add_agent_id.clone(),
-                        format!("Shell {next}"),
-                        window,
-                        cx,
-                    );
+                    this.add_next_shell_tab(add_agent_id.clone(), window, cx);
                 }))
                 .child("+"),
         );
@@ -2699,12 +2762,117 @@ impl Workspace {
 /// qualify, so a program path containing `=` isn't mistaken for one.
 fn split_assignment(word: &str) -> Option<(String, String)> {
     let (name, value) = word.split_once('=')?;
-    let valid = !name.is_empty()
+    is_var_name(name).then(|| (name.to_string(), value.to_string()))
+}
+
+fn is_var_name(name: &str) -> bool {
+    !name.is_empty()
         && !name.starts_with(|c: char| c.is_ascii_digit())
         && name
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_');
-    valid.then(|| (name.to_string(), value.to_string()))
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Environment harmonium provides for one agent's processes: the agent
+/// session, its resumes, and its shell tabs. Preset commands can reference
+/// these with `$VAR` (see `expand_vars`), which is how an isolation preset
+/// learns what to mount: a worktree's `.git` is a *file* pointing into the
+/// main repository's `.git/worktrees/`, so a container that sees only the
+/// workdir has no working git.
+fn task_env(project_path: &Path, workdir: &Path, branch: Option<&str>) -> Vec<(String, String)> {
+    let mut env = vec![
+        (
+            "HARMONIUM_TASK_GIT_ROOT".to_string(),
+            project_path.to_string_lossy().into_owned(),
+        ),
+        (
+            "HARMONIUM_TASK_WORKDIR".to_string(),
+            workdir.to_string_lossy().into_owned(),
+        ),
+    ];
+    // Deliberately absent rather than empty when the agent works on whatever
+    // the base checkout has out: `${HARMONIUM_TASK_BRANCH}` then stays
+    // literal, which is visible, instead of silently vanishing.
+    if let Some(branch) = branch {
+        env.push(("HARMONIUM_TASK_BRANCH".to_string(), branch.to_string()));
+    }
+    env
+}
+
+/// Expand `$NAME` and `${NAME}` in one command word against `vars`, falling
+/// back to the process environment. Commands are exec'd without a shell, so
+/// without this a preset's `-v $HARMONIUM_TASK_GIT_ROOT:/repo` would reach
+/// the program literally.
+///
+/// Unknown names are left as written rather than expanded to nothing: an
+/// empty expansion would turn a typo into a plausible-looking `-v :/repo`,
+/// whereas the literal text points straight at the mistake. `$$` is a
+/// literal `$`.
+fn expand_vars(word: &str, vars: &[(String, String)]) -> String {
+    let lookup = |name: &str| -> Option<String> {
+        if !is_var_name(name) {
+            return None;
+        }
+        vars.iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var(name).ok())
+    };
+    let mut out = String::with_capacity(word.len());
+    let mut chars = word.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('$') => {
+                chars.next();
+                out.push('$');
+            }
+            Some('{') => {
+                chars.next();
+                let mut name = String::new();
+                let mut closed = false;
+                for c in chars.by_ref() {
+                    if c == '}' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(c);
+                }
+                match lookup(&name).filter(|_| closed) {
+                    Some(value) => out.push_str(&value),
+                    None => {
+                        out.push_str("${");
+                        out.push_str(&name);
+                        if closed {
+                            out.push('}');
+                        }
+                    }
+                }
+            }
+            _ => {
+                let mut name = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        name.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                match lookup(&name) {
+                    Some(value) => out.push_str(&value),
+                    None => {
+                        out.push('$');
+                        out.push_str(&name);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn shellexpand_home(path: &str) -> String {
@@ -2746,6 +2914,7 @@ impl Render for Workspace {
             .bg(theme::bg())
             .text_size(theme::ui_font_size(cx))
             .font_family(theme::ui_font().family.clone())
+            .on_action(cx.listener(Self::new_terminal_tab))
             .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
                 if this.resizing_sidebar {
                     if event.pressed_button == Some(gpui::MouseButton::Left) {
@@ -2800,5 +2969,100 @@ impl Render for Workspace {
         }
 
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vars() -> Vec<(String, String)> {
+        task_env(
+            Path::new("/repos/harmonium"),
+            Path::new("/data/worktrees/fix-login"),
+            Some("fix-login"),
+        )
+    }
+
+    #[test]
+    fn task_env_vars() {
+        assert_eq!(
+            vars(),
+            vec![
+                (
+                    "HARMONIUM_TASK_GIT_ROOT".to_string(),
+                    "/repos/harmonium".to_string()
+                ),
+                (
+                    "HARMONIUM_TASK_WORKDIR".to_string(),
+                    "/data/worktrees/fix-login".to_string()
+                ),
+                ("HARMONIUM_TASK_BRANCH".to_string(), "fix-login".to_string()),
+            ]
+        );
+        // No branch: the variable is absent, not empty.
+        let root = Path::new("/repos/harmonium");
+        let base = task_env(root, root, None);
+        assert!(base.iter().all(|(k, _)| k != "HARMONIUM_TASK_BRANCH"));
+    }
+
+    #[test]
+    fn expands_task_vars() {
+        let vars = vars();
+        assert_eq!(
+            expand_vars("$HARMONIUM_TASK_GIT_ROOT:/repo", &vars),
+            "/repos/harmonium:/repo"
+        );
+        assert_eq!(
+            expand_vars("${HARMONIUM_TASK_WORKDIR}/sub", &vars),
+            "/data/worktrees/fix-login/sub"
+        );
+        assert_eq!(expand_vars("no-vars-here", &vars), "no-vars-here");
+    }
+
+    #[test]
+    fn expansion_falls_back_to_process_env() {
+        // SAFETY: single-threaded test process; no other thread reads the env.
+        unsafe { std::env::set_var("HARMONIUM_TEST_EXPAND", "from-process") };
+        assert_eq!(
+            expand_vars("$HARMONIUM_TEST_EXPAND", &vars()),
+            "from-process"
+        );
+        // Task vars win over the process environment.
+        unsafe { std::env::set_var("HARMONIUM_TASK_GIT_ROOT", "/wrong") };
+        assert_eq!(
+            expand_vars("$HARMONIUM_TASK_GIT_ROOT", &vars()),
+            "/repos/harmonium"
+        );
+        unsafe { std::env::remove_var("HARMONIUM_TASK_GIT_ROOT") };
+        unsafe { std::env::remove_var("HARMONIUM_TEST_EXPAND") };
+    }
+
+    #[test]
+    fn unknown_vars_stay_literal() {
+        let vars = vars();
+        assert_eq!(
+            expand_vars("$HARMONIUM_TASK_NOPE:/repo", &vars),
+            "$HARMONIUM_TASK_NOPE:/repo"
+        );
+        assert_eq!(expand_vars("${NOPE_UNSET}", &vars), "${NOPE_UNSET}");
+        // Unterminated brace and a bare `$` are left alone too.
+        assert_eq!(
+            expand_vars("${HARMONIUM_TASK_BRANCH", &vars),
+            "${HARMONIUM_TASK_BRANCH"
+        );
+        assert_eq!(expand_vars("cost: 5$", &vars), "cost: 5$");
+        assert_eq!(expand_vars("$$HOME", &vars), "$HOME");
+    }
+
+    #[test]
+    fn assignments_are_env_names_only() {
+        assert_eq!(
+            split_assignment("FOO=bar"),
+            Some(("FOO".to_string(), "bar".to_string()))
+        );
+        assert_eq!(split_assignment("/usr/bin/a=b"), None);
+        assert_eq!(split_assignment("2FOO=bar"), None);
+        assert_eq!(split_assignment("claude"), None);
     }
 }

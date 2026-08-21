@@ -77,6 +77,13 @@ pub struct PresetRecord {
 }
 
 pub fn default_presets() -> Vec<PresetRecord> {
+    // The isolated presets mount the main repository at its own path: an
+    // agent's workdir is usually a worktree whose `.git` is a file pointing
+    // into `<git root>/.git/worktrees/…`, so a sandbox that sees only the
+    // workdir has no working git. `-v` is repeatable and understood by both
+    // modes (bubblewrap translates it to a bind), and it must come before the
+    // `--` separator — everything after that goes to claude.
+    const MOUNT_GIT_ROOT: &str = "-v $HARMONIUM_TASK_GIT_ROOT:$HARMONIUM_TASK_GIT_ROOT";
     vec![
         PresetRecord {
             name: "claude-code".into(),
@@ -85,13 +92,13 @@ pub fn default_presets() -> Vec<PresetRecord> {
         },
         PresetRecord {
             name: "claude-code isolated bubblewrap".into(),
-            command: "claude-isol --local".into(),
-            resume_command: "claude-isol --local -- --continue".into(),
+            command: format!("claude-isol --local {MOUNT_GIT_ROOT}"),
+            resume_command: format!("claude-isol --local {MOUNT_GIT_ROOT} -- --continue"),
         },
         PresetRecord {
             name: "claude-code isolated container".into(),
-            command: "claude-isol".into(),
-            resume_command: "claude-isol -- --continue".into(),
+            command: format!("claude-isol {MOUNT_GIT_ROOT}"),
+            resume_command: format!("claude-isol {MOUNT_GIT_ROOT} -- --continue"),
         },
     ]
 }
@@ -159,6 +166,15 @@ impl AppState {
             .flat_map(|p| p.agents.iter())
             .find(|a| a.id == id)
     }
+
+    /// The project an agent belongs to. Agents don't store their project, but
+    /// spawning needs its path (the main repository root), so resolve it from
+    /// state on every spawn/resume/restore.
+    pub fn project_for_agent(&self, id: &str) -> Option<&ProjectRecord> {
+        self.projects
+            .iter()
+            .find(|p| p.agents.iter().any(|a| a.id == id))
+    }
 }
 
 /// Root directory for harmonium's own data (state file, managed worktrees).
@@ -207,3 +223,4 @@ pub fn save_state(state: &AppState) -> Result<()> {
     std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
+

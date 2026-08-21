@@ -50,6 +50,9 @@ Only the parts that aren't obvious from the UI:
   the alternate screen the wheel is otherwise translated to arrow keys, so
   pagers scroll as expected.
 - In the task dialog `enter` inserts a newline and `ctrl-enter` spawns.
+- `ctrl-shift-t` opens a new shell tab for the selected agent — the `+` in the
+  tab bar. It works while a terminal has the keyboard, but not while a dialog
+  field does.
 - `ctrl-q` quits.
 
 ## Configuration
@@ -81,6 +84,49 @@ the variable to have the agent render inline instead, so its output lands in
 the terminal's own scrollback and behaves like any other output — at the cost
 of claude's own scrollback UI. `CLAUDE_CODE_DISABLE_MOUSE=1` similarly hands
 the mouse back to the terminal.
+
+### Task variables
+
+Every process harmonium starts for an agent — the agent session, each resume,
+and the agent's shell tabs — is given the task's own environment:
+
+| Variable | Value |
+| --- | --- |
+| `HARMONIUM_TASK_GIT_ROOT` | The owning project's path, i.e. the **main repository**. |
+| `HARMONIUM_TASK_WORKDIR` | Where the agent runs: its worktree, or the project path in base mode. |
+| `HARMONIUM_TASK_BRANCH` | The agent's branch. **Unset** (not empty) when the agent works on whatever the base checkout has out. |
+
+Preset commands may reference them as `$VAR` or `${VAR}`, expanded by
+harmonium at spawn time — the command is exec'd directly, without a shell, so
+nothing else would expand them. This is what a sandbox preset needs: a
+worktree's `.git` is a *file* pointing into the main repository's
+`.git/worktrees/`, so a container that mounts only the workdir has no working
+git. Mount the main repository at its own path, which is where that file
+points:
+
+```
+claude-isol -v $HARMONIUM_TASK_GIT_ROOT:$HARMONIUM_TASK_GIT_ROOT
+claude-isol -v $HARMONIUM_TASK_GIT_ROOT:$HARMONIUM_TASK_GIT_ROOT -- --continue
+```
+
+Both shipped `claude-isol` presets (container and `--local` bubblewrap) do
+this out of the box; `-v` is repeatable and must come before the `--`, since
+everything after it goes to claude. Note that the defaults only apply to a
+fresh `state.json` — an existing install keeps its saved presets, so add the
+mount by hand in Settings ▸ Presets.
+
+Details worth knowing:
+
+- Expansion looks at the task variables first, then harmonium's own
+  environment, so `$HOME` and friends work too.
+- **Unknown names are left literal.** A mistyped `$HARMONIUM_TASK_GITROOT`
+  reaches the program as written instead of expanding to nothing and quietly
+  producing `-v :/repo`. Write `$$` for a literal `$`.
+- Expansion happens per word *after* the command is split, so a path
+  containing spaces stays a single argument; and per spawn against current
+  values, so `state.json` keeps the unexpanded command and stays portable.
+- A `KEY=value` prefix wins over a task variable of the same name, e.g.
+  `HARMONIUM_TASK_GIT_ROOT=/elsewhere claude-isol …`.
 
 ## Building
 

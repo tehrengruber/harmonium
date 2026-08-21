@@ -8,11 +8,11 @@ use std::ops::Range;
 
 use gpui::{
     actions, div, fill, point, px, relative, size, App, AvailableSpace, Bounds, ClipboardItem,
-    Context, CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler,
+    ContentMask, Context, CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     EventEmitter, FocusHandle, Focusable, GlobalElementId, InteractiveElement as _, IntoElement,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    ParentElement as _, Pixels, Point, Render, SharedString, Style, Styled as _, TextAlign,
-    TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine,
+    ParentElement as _, Pixels, Point, Render, ScrollWheelEvent, SharedString, Style, Styled as _,
+    TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
@@ -107,6 +107,16 @@ impl LayoutInfo {
     }
 }
 
+/// Width of the caret quad. The visible area is kept this much wider than the
+/// cursor position so a cursor at the very end of the text isn't half-clipped.
+const CARET_WIDTH: Pixels = px(2.);
+
+/// How far a single-line field can be scrolled: the text plus room for the
+/// caret sitting just past its last glyph, minus what is already visible.
+fn max_scroll(text_width: Pixels, field_width: Pixels) -> Pixels {
+    (text_width + CARET_WIDTH - field_width).max(px(0.))
+}
+
 pub struct TextInput {
     focus_handle: FocusHandle,
     content: SharedString,
@@ -118,6 +128,15 @@ pub struct TextInput {
     last_layout: Option<LayoutInfo>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    /// How far the single-line view is scrolled to the right, in pixels. Text
+    /// wider than the field is clipped, not shrunk, so this is what makes the
+    /// overflow reachable: the caret drags it along, and the wheel scrolls it
+    /// without moving the caret. Always zero in multiline mode, which wraps.
+    scroll_offset: Pixels,
+    /// Set whenever the caret moves or the text changes: the next paint scrolls
+    /// it back into view. Cleared there, so a wheel scroll that deliberately
+    /// looks away isn't yanked back on the following frame.
+    scroll_to_cursor: bool,
 }
 
 impl EventEmitter<InputEvent> for TextInput {}
@@ -143,6 +162,8 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            scroll_offset: px(0.),
+            scroll_to_cursor: true,
         }
     }
 
@@ -151,6 +172,11 @@ impl TextInput {
         let len = self.content.len();
         self.selected_range = len..len;
         self.marked_range = None;
+        // Show the beginning even though the caret lands at the end: a field
+        // filled in by the app (a preset command, a path) is there to be read
+        // first, and any edit scrolls the caret back into view anyway.
+        self.scroll_offset = px(0.);
+        self.scroll_to_cursor = false;
         cx.notify();
     }
 
@@ -292,6 +318,49 @@ impl TextInput {
         }
     }
 
+    /// Wheel over a single-line field pans the text horizontally, so overflow
+    /// can be read (and clicked into) without first moving the caret. Either
+    /// axis scrolls: a plain vertical wheel is the only one most mice have.
+    fn on_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.multiline {
+            return;
+        }
+        let delta = event.delta.pixel_delta(window.line_height());
+        let delta = if delta.x == px(0.) { delta.y } else { delta.x };
+        let target = (self.scroll_offset - delta).clamp(px(0.), self.max_scroll_offset());
+        if target == self.scroll_offset {
+            // Nothing to pan here — let the event bubble so the surrounding
+            // dialog scrolls instead, which is what the user meant.
+            return;
+        }
+        self.scroll_offset = target;
+        self.scroll_to_cursor = false;
+        // A field that *did* pan swallows the event: scrolling inside an input
+        // must not also scroll the dialog behind it.
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// Scroll limit from the last painted layout. Prepaint recomputes this from
+    /// the fresh layout; this is for input handlers, which run between frames.
+    fn max_scroll_offset(&self) -> Pixels {
+        let (Some(layout), Some(bounds)) = (self.last_layout.as_ref(), self.last_bounds.as_ref())
+        else {
+            return px(0.);
+        };
+        let text_width = layout
+            .lines
+            .first()
+            .map(|line| line.size(layout.line_height).width)
+            .unwrap_or_default();
+        max_scroll(text_width, bounds.size.width)
+    }
+
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             let text = if self.multiline {
@@ -322,6 +391,7 @@ impl TextInput {
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
+        self.scroll_to_cursor = true;
         cx.notify()
     }
 
@@ -342,7 +412,13 @@ impl TextInput {
         else {
             return 0;
         };
-        layout.index_for_position(position - bounds.origin)
+        layout.index_for_position(self.text_position(position, bounds))
+    }
+
+    /// Window position → position within the shaped text, undoing both the
+    /// element's origin and the horizontal scroll.
+    fn text_position(&self, position: Point<Pixels>, bounds: &Bounds<Pixels>) -> Point<Pixels> {
+        position - bounds.origin + point(self.scroll_offset, px(0.))
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -355,6 +431,7 @@ impl TextInput {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.scroll_to_cursor = true;
         cx.notify()
     }
 
@@ -469,6 +546,7 @@ impl EntityInputHandler for TextInput {
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
+        self.scroll_to_cursor = true;
         cx.notify();
     }
 
@@ -499,6 +577,7 @@ impl EntityInputHandler for TextInput {
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .map(|new_range| new_range.start + range.start..new_range.end + range.end)
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.scroll_to_cursor = true;
 
         cx.notify();
     }
@@ -514,9 +593,12 @@ impl EntityInputHandler for TextInput {
         let range = self.range_from_utf16(&range_utf16);
         let start = layout.position_for_index(range.start)?;
         let end = layout.position_for_index(range.end)?;
+        // Where the range is *painted*: the IME candidate window must follow
+        // the scrolled text, not the unscrolled layout.
+        let origin = bounds.origin - point(self.scroll_offset, px(0.));
         Some(Bounds::from_corners(
-            bounds.origin + start,
-            bounds.origin + end + point(px(0.), layout.line_height),
+            origin + start,
+            origin + end + point(px(0.), layout.line_height),
         ))
     }
 
@@ -528,7 +610,7 @@ impl EntityInputHandler for TextInput {
     ) -> Option<usize> {
         let bounds = self.last_bounds?;
         let layout = self.last_layout.as_ref()?;
-        let utf8_index = layout.index_for_position(point - bounds.origin);
+        let utf8_index = layout.index_for_position(self.text_position(point, &bounds));
         if utf8_index > self.content.len() {
             return None;
         }
@@ -544,6 +626,9 @@ struct PrepaintState {
     layout: Option<LayoutInfo>,
     cursor: Option<PaintQuad>,
     selection_quads: Vec<PaintQuad>,
+    /// Where the first line is painted: the element origin shifted left by the
+    /// horizontal scroll.
+    text_origin: Point<Pixels>,
 }
 
 impl IntoElement for TextElement {
@@ -710,6 +795,8 @@ impl gpui::Element for TextElement {
         let cursor_offset = input.cursor_offset();
         let multiline = input.multiline;
         let marked_range = input.marked_range.clone();
+        let mut scroll_offset = input.scroll_offset;
+        let scroll_to_cursor = input.scroll_to_cursor;
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
@@ -731,15 +818,39 @@ impl gpui::Element for TextElement {
             window,
         );
 
+        // Single-line text is never wrapped or shrunk, so a long value runs
+        // past the field: pan it instead. Multiline wraps, so it stays at 0.
+        if multiline {
+            scroll_offset = px(0.);
+        } else {
+            let text_width = layout
+                .lines
+                .first()
+                .map(|line| line.size(line_height).width)
+                .unwrap_or_default();
+            scroll_offset = scroll_offset.clamp(px(0.), max_scroll(text_width, bounds.size.width));
+            if scroll_to_cursor {
+                if let Some(position) = layout.position_for_index(cursor_offset) {
+                    if position.x < scroll_offset {
+                        scroll_offset = position.x;
+                    } else if position.x + CARET_WIDTH > scroll_offset + bounds.size.width {
+                        scroll_offset = position.x + CARET_WIDTH - bounds.size.width;
+                    }
+                }
+            }
+        }
+        let origin = bounds.origin - point(scroll_offset, px(0.));
+        self.input.update(cx, |input, _cx| {
+            input.scroll_offset = scroll_offset;
+            input.scroll_to_cursor = false;
+        });
+
         let mut selection_quads = Vec::new();
         let mut cursor = None;
         if selected_range.is_empty() {
             if let Some(position) = layout.position_for_index(cursor_offset) {
                 cursor = Some(fill(
-                    Bounds::new(
-                        bounds.origin + position,
-                        size(px(2.), line_height),
-                    ),
+                    Bounds::new(origin + position, size(CARET_WIDTH, line_height)),
                     theme::accent(),
                 ));
             }
@@ -767,8 +878,8 @@ impl gpui::Element for TextElement {
                 };
                 selection_quads.push(fill(
                     Bounds::from_corners(
-                        bounds.origin + point(start_position.x, row_top),
-                        bounds.origin + point(end_position.x, row_top + line_height),
+                        origin + point(start_position.x, row_top),
+                        origin + point(end_position.x, row_top + line_height),
                     ),
                     selection_color,
                 ));
@@ -779,6 +890,7 @@ impl gpui::Element for TextElement {
             layout: Some(layout),
             cursor,
             selection_quads,
+            text_origin: origin,
         }
     }
 
@@ -798,32 +910,46 @@ impl gpui::Element for TextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        for quad in prepaint.selection_quads.drain(..) {
-            window.paint_quad(quad);
-        }
-        if let Some(layout) = prepaint.layout.take() {
-            let mut y = px(0.);
-            for (i, line) in layout.lines.iter().enumerate() {
-                let _ = line.paint(
-                    bounds.origin + point(px(0.), y),
-                    layout.line_height,
-                    TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                );
-                y += layout.line_block_height(i);
+        // Scrolled-away text must not paint over the field's border or its
+        // neighbours, so everything below is clipped to the element's bounds.
+        let mask = ContentMask { bounds };
+        let origin = prepaint.text_origin;
+        let selection_quads: Vec<_> = prepaint.selection_quads.drain(..).collect();
+        let layout = prepaint.layout.take();
+        let cursor = prepaint.cursor.take();
+        let focused = focus_handle.is_focused(window);
+
+        let painted_layout = window.with_content_mask(Some(mask), |window| {
+            for quad in selection_quads {
+                window.paint_quad(quad);
             }
+            if let Some(layout) = layout.as_ref() {
+                let mut y = px(0.);
+                for (i, line) in layout.lines.iter().enumerate() {
+                    let _ = line.paint(
+                        origin + point(px(0.), y),
+                        layout.line_height,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                    y += layout.line_block_height(i);
+                }
+            }
+            if focused {
+                if let Some(cursor) = cursor {
+                    window.paint_quad(cursor);
+                }
+            }
+            layout
+        });
+
+        if let Some(layout) = painted_layout {
             self.input.update(cx, |input, _cx| {
                 input.last_layout = Some(layout);
                 input.last_bounds = Some(bounds);
             });
-        }
-
-        if focus_handle.is_focused(window) {
-            if let Some(cursor) = prepaint.cursor.take() {
-                window.paint_quad(cursor);
-            }
         }
     }
 }
@@ -862,7 +988,9 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .w_full()
+            .overflow_hidden()
             .px_2()
             .py_1()
             .bg(theme::terminal_bg())
@@ -881,5 +1009,20 @@ impl Render for TextInput {
 impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scroll_limit_leaves_room_for_the_caret() {
+        // Text wider than the field: scrollable by the difference, plus the
+        // caret width so the position past the last glyph is reachable.
+        assert_eq!(max_scroll(px(300.), px(100.)), px(202.));
+        // Text that fits never scrolls.
+        assert_eq!(max_scroll(px(50.), px(100.)), px(0.));
+        assert_eq!(max_scroll(px(0.), px(100.)), px(0.));
     }
 }

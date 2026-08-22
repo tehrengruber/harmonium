@@ -404,6 +404,25 @@ fn existing_worktree_for_branch(repo: &Path, branch: &str) -> Option<PathBuf> {
     None
 }
 
+/// Whether `workdir` has uncommitted work: staged, modified or untracked
+/// files. Ignored files don't count — build output shouldn't pin a worktree
+/// down. This is the same question `git worktree remove` asks before it
+/// refuses, asked early so the refusal can be explained.
+pub fn is_dirty(workdir: &Path) -> Result<bool> {
+    Ok(!git(workdir, &["status", "--porcelain"])?.trim().is_empty())
+}
+
+/// Delete the worktree at `workdir`, both its directory and the metadata
+/// `repo` keeps for it. The **branch is left alone**: its commits are what the
+/// work actually is, and they stay reachable once the checkout is gone.
+pub fn remove_worktree(repo: &Path, workdir: &Path) -> Result<()> {
+    git(
+        repo,
+        &["worktree", "remove", &workdir.to_string_lossy()],
+    )?;
+    Ok(())
+}
+
 fn branch_exists_locally(repo: &Path, branch: &str) -> bool {
     git(repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]).is_ok()
 }
@@ -566,6 +585,21 @@ mod tests {
         let ws4 = resolve_workspace(&repo, &plan, "quick").unwrap();
         assert_eq!(ws4.workdir, repo);
         assert!(ws4.branch.is_none());
+
+        // A fresh worktree is clean; any uncommitted work makes it dirty.
+        assert!(!is_dirty(&ws.workdir).unwrap());
+        std::fs::write(ws.workdir.join("b.txt"), "wip").unwrap();
+        assert!(is_dirty(&ws.workdir).unwrap(), "untracked file counts");
+        // Removal refuses while it is dirty, so no work can be lost.
+        assert!(remove_worktree(&repo, &ws.workdir).is_err());
+        std::fs::remove_file(ws.workdir.join("b.txt")).unwrap();
+        assert!(!is_dirty(&ws.workdir).unwrap());
+
+        // Clean: the checkout goes, the branch stays.
+        remove_worktree(&repo, &ws.workdir).unwrap();
+        assert!(!ws.workdir.exists());
+        assert!(branch_exists_locally(&repo, "harmonium/test-task"));
+        assert!(existing_worktree_for_branch(&repo, "harmonium/test-task").is_none());
 
         let _ = std::fs::remove_dir_all(&base);
     }

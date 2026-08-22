@@ -34,6 +34,15 @@ it if it exits.
 Worktrees live under `~/.local/share/harmonium/worktrees/<repo>-<hash>/<branch>`
 and state in `~/.local/share/harmonium/state.json`.
 
+Removing an agent (the `×` in the sidebar) deletes its worktree too, but only
+if that worktree is **clean** — staged, modified or untracked files block the
+removal with a message naming the directory, since killing the session and
+deleting the checkout has no undo. Ignored files (build output) don't count.
+The **branch is kept**, so anything committed there survives and a later task
+on the same branch picks up where this one left off. Nothing is deleted for a
+base-mode agent (it runs in the project's own checkout) or when a second agent
+shares the same worktree.
+
 ## Keyboard & mouse
 
 Only the parts that aren't obvious from the UI:
@@ -233,6 +242,5 @@ src/
     view.rs        focusable view routing keys/scroll to the PTY
 ```
 
-Known limitations (v1): removing an agent leaves its worktree on disk, and
-the agent description is stored but not editable in the UI (only the name
-is).
+Known limitations (v1): the agent description is stored but not editable in
+the UI (only the name is).

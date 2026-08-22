@@ -1380,15 +1380,91 @@ impl Workspace {
         }
     }
 
-    fn remove_agent(&mut self, id: AgentId, cx: &mut Context<Self>) {
-        if let Some(record) = self.state.agent(&id) {
-            log::info(format!("agent {}: removed", record.name));
+    /// The worktree an agent owns outright, as `(repository, worktree)` —
+    /// i.e. the one that may be deleted with it. `None` for the cases where
+    /// the directory isn't ours to delete:
+    ///
+    /// - base mode, where the agent works in the project's own checkout;
+    /// - a worktree another agent is also using (git allows one worktree per
+    ///   branch, so two tasks on one branch share a directory);
+    /// - a workdir that is already gone.
+    fn owned_worktree(&self, id: &AgentId, record: &AgentRecord) -> Option<(PathBuf, PathBuf)> {
+        let repo = self.state.project_for_agent(id)?.path.clone();
+        if record.branch.is_none() || record.workdir == repo || !record.workdir.is_dir() {
+            return None;
         }
-        let tab_ids: Vec<String> = self
+        let shared = self
             .state
-            .agent(&id)
-            .map(|record| record.terminals.iter().map(|t| t.id.clone()).collect())
-            .unwrap_or_default();
+            .projects
+            .iter()
+            .flat_map(|project| project.agents.iter())
+            .any(|other| other.id != *id && other.workdir == record.workdir);
+        if shared {
+            log::info(format!(
+                "agent {}: keeping worktree {}, another agent is using it",
+                record.name,
+                record.workdir.display()
+            ));
+            return None;
+        }
+        Some((repo, record.workdir.clone()))
+    }
+
+    /// Remove an agent and delete the worktree it was working in — but only
+    /// once that worktree is clean. Deleting a task kills its terminals and
+    /// its checkout with no undo, so uncommitted work blocks the whole
+    /// operation rather than being thrown away. The branch survives either
+    /// way, so anything committed is still reachable afterwards.
+    fn remove_agent(&mut self, id: AgentId, cx: &mut Context<Self>) {
+        let Some(record) = self.state.agent(&id).cloned() else {
+            return;
+        };
+        if let Some((repo, workdir)) = self.owned_worktree(&id, &record) {
+            match planner::is_dirty(&workdir) {
+                Ok(true) => {
+                    self.set_status(
+                        format!(
+                            "{}: worktree has uncommitted changes — commit or discard them in {} first",
+                            record.name,
+                            workdir.display()
+                        ),
+                        true,
+                        cx,
+                    );
+                    return;
+                }
+                Err(error) => {
+                    self.set_status(
+                        format!("{}: cannot check the worktree: {error:#}", record.name),
+                        true,
+                        cx,
+                    );
+                    return;
+                }
+                Ok(false) => {}
+            }
+            // Before the teardown below: if git refuses, nothing has been
+            // killed yet and the agent is left exactly as it was.
+            if let Err(error) = planner::remove_worktree(&repo, &workdir) {
+                self.set_status(
+                    format!("{}: cannot remove the worktree: {error:#}", record.name),
+                    true,
+                    cx,
+                );
+                return;
+            }
+            log::info(format!(
+                "agent {}: worktree {} removed, branch {} kept",
+                record.name,
+                workdir.display(),
+                record.branch.as_deref().unwrap_or("(none)")
+            ));
+        }
+        log::info(format!("agent {}: removed", record.name));
+        // A refusal from an earlier attempt must not linger next to a delete
+        // that just worked.
+        self.status = None;
+        let tab_ids: Vec<String> = record.terminals.iter().map(|t| t.id.clone()).collect();
         self.teardown_agent(&id, &tab_ids, cx);
         for project in &mut self.state.projects {
             project.agents.retain(|a| a.id != id);

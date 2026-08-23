@@ -11,7 +11,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::state::data_dir;
+use crate::state::{data_dir, WorkspaceMode};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct TaskPlan {
@@ -317,6 +317,38 @@ fn parse_plan_json(text: &str) -> Result<TaskPlan> {
     bail!("unterminated JSON in planner output: {}", snippet(text))
 }
 
+/// Override the workspace the planner chose with the one the user asked for.
+/// Only the *placement* is forced — the agent name stays whatever the planner
+/// derived from the task, which is why the planner runs in every mode.
+///
+/// Forcing a worktree keeps the planner's branch when it named one (including
+/// an existing branch the task refers to, which `resolve_workspace` then
+/// checks out in a worktree of its own), and derives one otherwise: the LLM
+/// leaves `branch` empty whenever it meant to work on the base checkout.
+pub fn apply_workspace_mode(plan: &mut TaskPlan, mode: WorkspaceMode, task: &str) {
+    match mode {
+        WorkspaceMode::Auto => {}
+        WorkspaceMode::NewWorktree => {
+            if plan.mode == "base" {
+                plan.mode = "new_branch".into();
+            }
+            if plan.branch.as_deref().unwrap_or("").trim().is_empty() {
+                let source = plan
+                    .agent_name
+                    .as_deref()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or(task);
+                plan.branch = Some(format!("harmonium/{}", slugify(source, 4)));
+            }
+        }
+        WorkspaceMode::MainBranch => {
+            plan.mode = "base".into();
+            plan.branch = None;
+            plan.base_branch = None;
+        }
+    }
+}
+
 /// Fallback plan when the LLM is unavailable: new branch off the default branch.
 pub fn fallback_plan(repo: &Path, task: &str) -> TaskPlan {
     TaskPlan {
@@ -616,6 +648,60 @@ mod tests {
             vec!["claude-isol", "-v", "/my data:/data", "--local"]
         );
         assert_eq!(split_command("  "), Vec::<String>::new());
+    }
+
+    fn plan(mode: &str, branch: Option<&str>) -> TaskPlan {
+        TaskPlan {
+            mode: mode.into(),
+            branch: branch.map(str::to_string),
+            base_branch: Some("main".into()),
+            agent_name: Some("fix login crash".into()),
+        }
+    }
+
+    #[test]
+    fn workspace_mode_auto_changes_nothing() {
+        let mut p = plan("base", None);
+        apply_workspace_mode(&mut p, WorkspaceMode::Auto, "work on the checkout");
+        assert_eq!(p.mode, "base");
+        assert_eq!(p.branch, None);
+    }
+
+    #[test]
+    fn workspace_mode_forces_a_worktree() {
+        // The planner wanted the base checkout and named no branch, so one is
+        // derived from the name it *did* give.
+        let mut p = plan("base", None);
+        apply_workspace_mode(&mut p, WorkspaceMode::NewWorktree, "just look around");
+        assert_eq!(p.mode, "new_branch");
+        assert_eq!(p.branch.as_deref(), Some("harmonium/fix-login-crash"));
+
+        // A branch the planner chose is kept, existing ones included.
+        let mut p = plan("existing_branch", Some("feature/login"));
+        apply_workspace_mode(&mut p, WorkspaceMode::NewWorktree, "continue the login work");
+        assert_eq!(p.mode, "existing_branch");
+        assert_eq!(p.branch.as_deref(), Some("feature/login"));
+
+        // No agent name to derive from: fall back to the task text.
+        let mut p = TaskPlan {
+            mode: "base".into(),
+            branch: Some("  ".into()),
+            base_branch: None,
+            agent_name: None,
+        };
+        apply_workspace_mode(&mut p, WorkspaceMode::NewWorktree, "Add a Retry Button");
+        assert_eq!(p.branch.as_deref(), Some("harmonium/add-a-retry-button"));
+    }
+
+    #[test]
+    fn workspace_mode_forces_the_base_checkout() {
+        let mut p = plan("new_branch", Some("harmonium/whatever"));
+        apply_workspace_mode(&mut p, WorkspaceMode::MainBranch, "fix the login crash");
+        assert_eq!(p.mode, "base");
+        assert_eq!(p.branch, None);
+        assert_eq!(p.base_branch, None);
+        // The name is the planner's in every mode.
+        assert_eq!(p.agent_name.as_deref(), Some("fix login crash"));
     }
 
     #[test]

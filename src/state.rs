@@ -70,6 +70,37 @@ impl ProjectRecord {
     }
 }
 
+/// Which workspace a new agent gets. The task description always decides the
+/// agent's *name*; this only decides where it works.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMode {
+    /// Derived from the task description, along with everything else: a new
+    /// branch, an existing one the task refers to, or the base checkout.
+    #[default]
+    Auto,
+    /// Always a worktree on its own branch, whatever the task sounds like.
+    NewWorktree,
+    /// Always the project's own checkout — no worktree, no branch of its own.
+    MainBranch,
+}
+
+impl WorkspaceMode {
+    pub const ALL: [WorkspaceMode; 3] = [
+        WorkspaceMode::Auto,
+        WorkspaceMode::NewWorktree,
+        WorkspaceMode::MainBranch,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WorkspaceMode::Auto => "Auto",
+            WorkspaceMode::NewWorktree => "New worktree",
+            WorkspaceMode::MainBranch => "Main branch",
+        }
+    }
+}
+
 /// A named agent command configuration selectable when spawning a task.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct PresetRecord {
@@ -161,6 +192,8 @@ pub struct SettingsRecord {
     /// Index of the preset last used to spawn an agent (preselected in the
     /// spawn dialog).
     pub last_preset: usize,
+    /// Workspace choice last used to spawn an agent, likewise preselected.
+    pub last_workspace_mode: WorkspaceMode,
     pub theme: crate::theme::ThemeMode,
     /// Full planner command line; when set it replaces the default
     /// `claude -p --model <planner_model>` and the model is unused.
@@ -183,6 +216,7 @@ impl Default for SettingsRecord {
             sidebar_collapsed: false,
             presets: default_presets(),
             last_preset: 0,
+            last_workspace_mode: WorkspaceMode::default(),
             theme: crate::theme::ThemeMode::default(),
             planner_command: String::new(),
             planner_model: crate::planner::DEFAULT_MODEL.to_string(),

@@ -16,7 +16,7 @@ use crate::log;
 use crate::planner;
 use crate::state::{
     load_state, save_state, AgentId, AgentRecord, AppState, PresetRecord, ProjectRecord,
-    TerminalTabRecord,
+    TerminalTabRecord, WorkspaceMode,
 };
 use crate::state;
 use crate::terminal::view::TerminalView;
@@ -36,6 +36,7 @@ enum Dialog {
         input: Entity<TextInput>,
         planning: bool,
         preset: usize,
+        workspace_mode: WorkspaceMode,
         error: Option<String>,
         _subscription: Subscription,
     },
@@ -731,6 +732,7 @@ impl Workspace {
             input,
             planning: false,
             preset,
+            workspace_mode: self.state.settings.last_workspace_mode,
             error: None,
             _subscription: subscription,
         });
@@ -973,9 +975,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let preset_index;
+        let workspace_mode;
         if let Some(Dialog::NewAgent {
             planning,
             preset,
+            workspace_mode: mode,
             error,
             ..
         }) = &mut self.dialog
@@ -986,8 +990,10 @@ impl Workspace {
             *planning = true;
             *error = None;
             preset_index = *preset;
+            workspace_mode = *mode;
         } else {
             preset_index = self.state.settings.last_preset;
+            workspace_mode = self.state.settings.last_workspace_mode;
         }
         let preset = self
             .state
@@ -1002,6 +1008,7 @@ impl Workspace {
                 env: String::new(),
             });
         self.state.settings.last_preset = preset_index;
+        self.state.settings.last_workspace_mode = workspace_mode;
         self.persist(cx);
         cx.notify();
 
@@ -1017,8 +1024,12 @@ impl Workspace {
                 .background_executor()
                 .spawn(async move {
                     // No fallback: if the planner fails (e.g. usage limit
-                    // reached), report it instead of inventing a branch.
-                    let plan = planner::plan_task(&repo_for_bg, &task_for_bg, &planner_settings)?;
+                    // reached), report it instead of inventing a branch. It
+                    // runs even when the workspace is already decided — the
+                    // agent's name comes from the task in every mode.
+                    let mut plan =
+                        planner::plan_task(&repo_for_bg, &task_for_bg, &planner_settings)?;
+                    planner::apply_workspace_mode(&mut plan, workspace_mode, &task_for_bg);
                     planner::resolve_workspace(&repo_for_bg, &plan, &task_for_bg)
                 })
                 .await;
@@ -2517,6 +2528,7 @@ impl Workspace {
                 input,
                 planning,
                 preset,
+                workspace_mode,
                 error,
                 ..
             } => {
@@ -2576,6 +2588,49 @@ impl Workspace {
                     );
                 }
                 panel = panel.child(chips);
+
+                // Workspace selector. The task description still names the
+                // agent in every mode; this only picks where it works.
+                let selected_mode = *workspace_mode;
+                let mut modes = div().flex().flex_wrap().items_center().gap_1().child(
+                    div()
+                        .text_color(theme::fg_dim())
+                        .text_sm()
+                        .child("Workspace:"),
+                );
+                for (index, mode) in WorkspaceMode::ALL.into_iter().enumerate() {
+                    let is_selected = mode == selected_mode;
+                    modes = modes.child(
+                        div()
+                            .id(("workspace-mode-chip", index))
+                            .px_2()
+                            .py_0p5()
+                            .rounded_sm()
+                            .text_sm()
+                            .cursor_pointer()
+                            .bg(if is_selected {
+                                theme::accent()
+                            } else {
+                                theme::selected_bg()
+                            })
+                            .text_color(if is_selected {
+                                theme::panel_bg()
+                            } else {
+                                theme::fg()
+                            })
+                            .hover(|s| s.opacity(0.85))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(Dialog::NewAgent { workspace_mode, .. }) =
+                                    &mut this.dialog
+                                {
+                                    *workspace_mode = mode;
+                                }
+                                cx.notify();
+                            }))
+                            .child(mode.label()),
+                    );
+                }
+                panel = panel.child(modes);
 
                 if let Some(error) = error {
                     panel = panel.child(

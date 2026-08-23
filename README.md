@@ -17,7 +17,16 @@ description into a workspace — an existing branch or PR checked out in a
 worktree, a fresh kebab-case branch off the default branch, or the project's
 base checkout — and to name the agent (`#<PR number> <summary>` for PR work,
 open PRs come from `gh pr list` when available). The preset's command then
-runs there in an embedded PTY with the task appended as its last argument. A
+runs there in an embedded PTY with the task appended as its last argument.
+
+The **Workspace** row in the spawn dialog decides how much of that is left to
+the LLM. *Auto* is the above. *New worktree* always puts the agent on a branch
+of its own, keeping the branch name the LLM suggested (or deriving one from
+the agent's name when it wanted the base checkout). *Main branch* always uses
+the project's own checkout, with no branch or worktree of its own. **The agent
+name is LLM-derived in every mode** — the planner runs regardless, only its
+workspace decision is overridden — and the choice is remembered for the next
+spawn. A
 preset is a named spawn command, resume command and environment; the defaults cover
 plain `claude` plus the sandboxed
 [claude-isol](https://github.com/tehrengruber/claude-container-isolation)

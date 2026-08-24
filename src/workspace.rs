@@ -26,7 +26,6 @@ use crate::theme;
 struct PresetInputs {
     name: Entity<TextInput>,
     command: Entity<TextInput>,
-    resume_command: Entity<TextInput>,
     env: Entity<TextInput>,
 }
 
@@ -60,6 +59,10 @@ enum Dialog {
         terminal_font: Entity<TextInput>,
         ui_font: Entity<TextInput>,
         preset_inputs: Vec<PresetInputs>,
+        /// Which preset row the planner should run through, as an index into
+        /// `preset_inputs` so a rename in the same visit still points at the
+        /// row the user picked. `None` is the built-in `claude -p`.
+        planner_preset_row: Option<usize>,
         _subscriptions: Vec<Subscription>,
     },
 }
@@ -812,8 +815,7 @@ impl Workspace {
         };
         PresetInputs {
             name: make("Preset name", &preset.name),
-            command: make("Command (task appended)", &preset.command),
-            resume_command: make("Resume command", &preset.resume_command),
+            command: make("Command (task, --continue or planner flags appended)", &preset.command),
             env: make("KEY=value KEY2=value2", &preset.env),
         }
     }
@@ -863,6 +865,13 @@ impl Workspace {
             Some(first) => window.focus(&first.name.focus_handle(cx)),
             None => window.focus(&focus_handle),
         }
+        let planner_preset_row = self.state.settings.planner_preset.as_deref().and_then(|name| {
+            self.state
+                .settings
+                .presets
+                .iter()
+                .position(|preset| preset.name == name)
+        });
         self.dialog = Some(Dialog::Settings {
             focus_handle,
             planner_command,
@@ -870,6 +879,7 @@ impl Workspace {
             terminal_font,
             ui_font,
             preset_inputs,
+            planner_preset_row,
             _subscriptions: subscriptions,
         });
         cx.notify();
@@ -923,36 +933,42 @@ impl Workspace {
             terminal_font,
             ui_font,
             preset_inputs,
+            planner_preset_row,
             ..
         }) = &self.dialog
         else {
             return;
         };
+        let planner_preset_row = *planner_preset_row;
         let text = |input: &Entity<TextInput>| input.read(cx).text().trim().to_string();
         let planner_command = text(planner_command);
         let planner_model = text(planner_model);
         let terminal_font = text(terminal_font);
         let ui_font = text(ui_font);
-        let presets: Vec<crate::state::PresetRecord> = preset_inputs
-            .iter()
-            .filter_map(|inputs| {
-                let name = inputs.name.read(cx).text().trim().to_string();
-                let command = inputs.command.read(cx).text().trim().to_string();
-                let resume_command =
-                    inputs.resume_command.read(cx).text().trim().to_string();
-                let env = inputs.env.read(cx).text().trim().to_string();
-                if name.is_empty() && command.is_empty() {
-                    return None;
-                }
-                Some(crate::state::PresetRecord {
-                    name: if name.is_empty() { command.clone() } else { name },
-                    command,
-                    resume_command,
-                    env,
-                })
-            })
-            .collect();
+        let mut presets: Vec<crate::state::PresetRecord> = Vec::new();
+        // Follow the planner's row through: empty rows are dropped here, so
+        // the saved name has to be looked up while the mapping is still known.
+        let mut planner_preset = None;
+        for (row, inputs) in preset_inputs.iter().enumerate() {
+            let name = inputs.name.read(cx).text().trim().to_string();
+            let command = inputs.command.read(cx).text().trim().to_string();
+            let env = inputs.env.read(cx).text().trim().to_string();
+            if name.is_empty() && command.is_empty() {
+                continue;
+            }
+            let name = if name.is_empty() { command.clone() } else { name };
+            if planner_preset_row == Some(row) {
+                planner_preset = Some(name.clone());
+            }
+            presets.push(crate::state::PresetRecord {
+                name,
+                command,
+                resume_command: None,
+                env,
+            });
+        }
         self.state.settings.presets = presets;
+        self.state.settings.planner_preset = planner_preset;
         self.state.settings.last_preset = self
             .state
             .settings
@@ -1018,7 +1034,7 @@ impl Workspace {
             .unwrap_or_else(|| PresetRecord {
                 name: "claude".into(),
                 command: "claude".into(),
-                resume_command: "claude --continue".into(),
+                resume_command: None,
                 env: String::new(),
             });
         self.state.settings.last_preset = preset_index;
@@ -1026,10 +1042,7 @@ impl Workspace {
         cx.notify();
 
         let repo = project_path.clone();
-        let planner_settings = planner::PlannerSettings {
-            command: self.state.settings.planner_command.clone(),
-            model: self.state.settings.planner_model.clone(),
-        };
+        let planner_settings = self.planner_settings();
         cx.spawn_in(window, async move |this, cx| {
             let repo_for_bg = repo.clone();
             let task_for_bg = task.clone();
@@ -1109,6 +1122,36 @@ impl Workspace {
         .detach();
     }
 
+    /// The preset the planner runs through, if one is selected and still
+    /// exists. Matched by name rather than index so reordering or editing the
+    /// list around it doesn't silently repoint the planner at another agent.
+    fn planner_preset(&self) -> Option<&PresetRecord> {
+        let name = self.state.settings.planner_preset.as_deref()?;
+        self.state
+            .settings
+            .presets
+            .iter()
+            .find(|preset| preset.name == name)
+    }
+
+    fn planner_settings(&self) -> planner::PlannerSettings {
+        let model = self.state.settings.planner_model.clone();
+        let preset = self.planner_preset();
+        planner::PlannerSettings {
+            command: self.state.settings.planner_command.clone(),
+            preset_command: preset
+                .map(|preset| preset.planner_command(&model))
+                .unwrap_or_default(),
+            // The planner is a one-shot run of the same agent, so it gets the
+            // preset's environment too — task variables aren't among them,
+            // since there is no task yet to describe.
+            env: preset
+                .map(|preset| parse_env(&preset.env, &[]))
+                .unwrap_or_default(),
+            model,
+        }
+    }
+
     /// The agent already working in `workspace`, if any. One task per
     /// directory, the project's own checkout included: two agents editing the
     /// same files is the hazard, and it doesn't get safer just because the
@@ -1138,9 +1181,9 @@ impl Workspace {
             description: task.clone(),
             workdir: workspace.workdir.clone(),
             branch: workspace.branch.clone(),
-            command: Some(preset.command),
-            resume_command: Some(preset.resume_command),
-            env: Some(preset.env),
+            command: Some(preset.command.clone()),
+            resume_command: Some(preset.resume_command()),
+            env: Some(preset.env.clone()),
             terminals: Vec::new(),
         };
         let Some(project) = self
@@ -2645,6 +2688,71 @@ impl Workspace {
             )
     }
 
+    /// Picks which agent preset the planner runs through. Reads the preset
+    /// *rows* rather than the saved list, so a name edited in this same visit
+    /// is what you choose from.
+    fn render_planner_preset_row(
+        &self,
+        preset_inputs: &[PresetInputs],
+        selected: Option<usize>,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let chip = |label: SharedString, row: Option<usize>, cx: &Context<Self>| {
+            let is_selected = row == selected;
+            div()
+                .id(("planner-preset", row.map(|r| r + 1).unwrap_or(0)))
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .text_sm()
+                .cursor_pointer()
+                .bg(if is_selected {
+                    theme::accent()
+                } else {
+                    theme::selected_bg()
+                })
+                .text_color(if is_selected {
+                    theme::panel_bg()
+                } else {
+                    theme::fg()
+                })
+                .hover(|s| s.opacity(0.85))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(Dialog::Settings {
+                        planner_preset_row, ..
+                    }) = &mut this.dialog
+                    {
+                        *planner_preset_row = row;
+                    }
+                    cx.notify();
+                }))
+                .child(label)
+        };
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .w_24()
+                    .flex_none()
+                    .text_color(theme::fg_dim())
+                    .child("Preset"),
+            )
+            .child(chip("Default (claude)".into(), None, cx));
+        for (index, inputs) in preset_inputs.iter().enumerate() {
+            let name = inputs.name.read(cx).text().trim().to_string();
+            let command = inputs.command.read(cx).text().trim().to_string();
+            if name.is_empty() && command.is_empty() {
+                continue;
+            }
+            let label = if name.is_empty() { command } else { name };
+            row = row.child(chip(label.into(), Some(index), cx));
+        }
+        row.into_any_element()
+    }
+
     fn render_theme_row(&self, cx: &Context<Self>) -> impl IntoElement {
         let current = theme::mode();
         let chip = |label: &'static str,
@@ -2947,6 +3055,7 @@ impl Workspace {
                 terminal_font,
                 ui_font,
                 preset_inputs,
+                planner_preset_row,
                 ..
             } => {
                 let section = |text: &'static str| {
@@ -3027,16 +3136,6 @@ impl Workspace {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(label("Resume"))
-                                    .child(
-                                        div().flex_1().child(inputs.resume_command.clone()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
                                     .child(label("Env"))
                                     .child(div().flex_1().child(inputs.env.clone())),
                             ),
@@ -3082,6 +3181,11 @@ impl Workspace {
                                     .text_xs()
                                     .child("Derives the branch and agent name from the task description."),
                             )
+                            .child(self.render_planner_preset_row(
+                                preset_inputs,
+                                *planner_preset_row,
+                                cx,
+                            ))
                             .child(field("Command", planner_command.clone()))
                             .child(field("Model", planner_model.clone()))
                             .when(

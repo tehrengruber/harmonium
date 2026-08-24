@@ -23,8 +23,19 @@ fn main() {
         let repo = std::path::PathBuf::from(&args[2]);
         let task = args[3..].join(" ");
         let settings = state::load_state().settings;
+        // Same resolution as the UI: an explicit command, else the selected
+        // agent preset, else the default. Preset environments are a UI concern
+        // and stay out of this debug helper.
+        let preset = settings
+            .planner_preset
+            .as_deref()
+            .and_then(|name| settings.presets.iter().find(|p| p.name == name));
         let planner_settings = planner::PlannerSettings {
             command: settings.planner_command,
+            preset_command: preset
+                .map(|p| p.planner_command(&settings.planner_model))
+                .unwrap_or_default(),
+            env: Vec::new(),
             model: settings.planner_model,
         };
         match planner::plan_task(&repo, &task, &planner_settings) {

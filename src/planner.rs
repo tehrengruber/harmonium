@@ -136,8 +136,14 @@ pub const DEFAULT_MODEL: &str = "haiku";
 /// for one-off runs.
 #[derive(Clone, Debug, Default)]
 pub struct PlannerSettings {
-    /// Full command line; when set, `model` is unused.
+    /// Full command line; when set, `preset_command` and `model` are unused.
     pub command: String,
+    /// Command line derived from the selected agent preset, already carrying
+    /// the print-mode flags and the model. Empty when no preset is selected.
+    pub preset_command: String,
+    /// Environment from that preset, so planning runs with the same settings
+    /// as the work — a sandbox preset plans inside the sandbox.
+    pub env: Vec<(String, String)>,
     /// Model for the default `claude -p --model <model>` command.
     pub model: String,
 }
@@ -228,9 +234,14 @@ about an existing pull request, it MUST have the form "#<PR number> <2-4 word su
         (None, Some(model)) => planner_command_for(&model)?,
         (None, None) => match non_empty(&settings.command) {
             Some(command) => command,
-            None => planner_command_for(
-                &non_empty(&settings.model).unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-            )?,
+            // Then the selected agent preset, which already carries its own
+            // flags, wrapper and model, and finally plain `claude -p`.
+            None => match non_empty(&settings.preset_command) {
+                Some(command) => command,
+                None => planner_command_for(
+                    &non_empty(&settings.model).unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+                )?,
+            },
         },
     };
     let mut parts = split_command(&command);
@@ -242,6 +253,7 @@ about an existing pull request, it MUST have the form "#<PR number> <2-4 word su
     let out = Command::new(&program)
         .args(&parts)
         .arg(&prompt)
+        .envs(settings.env.iter().cloned())
         .env_remove("ANTHROPIC_LOG")
         .output()
         .with_context(|| format!("running planner `{command}`"))?;

@@ -70,6 +70,59 @@ impl ProjectRecord {
     }
 }
 
+impl PresetRecord {
+    /// The command line that resumes a session started by this preset.
+    pub fn resume_command(&self) -> String {
+        format!("{} {RESUME_FLAG}", self.command.trim())
+    }
+
+    /// The command line that runs this preset's agent as the planner: print
+    /// mode, a model, and (appended by the planner itself) the prompt.
+    pub fn planner_command(&self, model: &str) -> String {
+        format!(
+            "{} {} --model {model}",
+            self.command.trim(),
+            PLANNER_FLAGS.join(" ")
+        )
+    }
+
+    /// Fold a pre-`RESUME_FLAG` state file's second command line into this
+    /// one. The old `resume_command` was the command repeated with a resume
+    /// flag on the end; anything *between* the two was a separator the wrapper
+    /// needs (`--` for claude-isol), which now belongs to the command itself.
+    fn migrate_resume_command(&mut self) {
+        let Some(legacy) = self.resume_command.take() else {
+            return;
+        };
+        let (legacy, command) = (legacy.trim(), self.command.trim().to_string());
+        if let Some(separator) = legacy
+            .strip_prefix(&command)
+            .and_then(|rest| rest.trim().strip_suffix(RESUME_FLAG))
+        {
+            let separator = separator.trim();
+            if !separator.is_empty() {
+                self.command = format!("{command} {separator}");
+            }
+            return;
+        }
+        // Hand-written and not expressible as "command + flag" any more. Say
+        // so rather than silently changing what the preset does.
+        crate::log::error(format!(
+            "preset `{}`: resume command `{legacy}` cannot be expressed as `{command} \
+             {RESUME_FLAG}` — resuming will use the latter; adjust the preset if that is wrong",
+            self.name
+        ));
+    }
+}
+
+/// Appended to a preset's command to resume its session instead of starting a
+/// new one. Every agent CLI harmonium ships a preset for spells it this way.
+pub const RESUME_FLAG: &str = "--continue";
+
+/// Flags that put an agent CLI in non-interactive print mode for planning.
+/// `--model` is appended after these, then the prompt.
+pub const PLANNER_FLAGS: [&str; 1] = ["-p"];
+
 /// Which workspace a new agent gets. The task description always decides the
 /// agent's *name*; this only decides where it works.
 ///
@@ -109,11 +162,17 @@ impl WorkspaceMode {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct PresetRecord {
     pub name: String,
-    /// Command line used to spawn the agent; the task text is appended as
-    /// the final argument.
+    /// How to launch the agent. Everything else is appended to it as further
+    /// arguments: the task text when spawning, [`RESUME_FLAG`] when resuming,
+    /// the planner's flags and prompt when this preset plans. A wrapper that
+    /// needs a separator before the agent's own flags carries it here — the
+    /// shipped `claude-isol` presets end in `--` for exactly that reason.
     pub command: String,
-    /// Command line used to resume the agent's session in its workdir.
-    pub resume_command: String,
+    /// Legacy: a second, near-identical command line for resuming. Read from
+    /// old state files and folded into nothing — the flag is appended now —
+    /// but never written back.
+    #[serde(default, skip_serializing)]
+    pub resume_command: Option<String>,
     /// Environment for the agent's processes, written as shell-style
     /// `KEY=value` words (`FOO=bar BAZ="a b"`). Applies to the agent session,
     /// its resumes and its shell tabs, unlike a `KEY=value` prefix on
@@ -162,24 +221,27 @@ pub fn default_presets() -> Vec<PresetRecord> {
     // workdir has no working git. `-v` is repeatable and understood by both
     // modes (bubblewrap translates it to a bind), and it must come before the
     // `--` separator — everything after that goes to claude.
+    // The isolated presets end in `--`: everything harmonium appends (the
+    // task, --continue, the planner's flags) is meant for claude, not for
+    // claude-isol, which rejects options it doesn't know.
     const MOUNT_GIT_ROOT: &str = "-v $HARMONIUM_TASK_GIT_ROOT:$HARMONIUM_TASK_GIT_ROOT";
     let mut presets = vec![PresetRecord {
         name: "claude-code".into(),
         command: "claude".into(),
-        resume_command: "claude --continue".into(),
+        resume_command: None,
         env: String::new(),
     }];
     if program_available("claude-isol") {
         presets.push(PresetRecord {
             name: "claude-code isolated bubblewrap".into(),
-            command: format!("claude-isol --local {MOUNT_GIT_ROOT}"),
-            resume_command: format!("claude-isol --local {MOUNT_GIT_ROOT} -- --continue"),
+            command: format!("claude-isol --local {MOUNT_GIT_ROOT} --"),
+            resume_command: None,
             env: String::new(),
         });
         presets.push(PresetRecord {
             name: "claude-code isolated container".into(),
-            command: format!("claude-isol {MOUNT_GIT_ROOT}"),
-            resume_command: format!("claude-isol {MOUNT_GIT_ROOT} -- --continue"),
+            command: format!("claude-isol {MOUNT_GIT_ROOT} --"),
+            resume_command: None,
             env: String::new(),
         });
     }
@@ -197,10 +259,16 @@ pub struct SettingsRecord {
     /// spawn dialog).
     pub last_preset: usize,
     pub theme: crate::theme::ThemeMode,
-    /// Full planner command line; when set it replaces the default
-    /// `claude -p --model <planner_model>` and the model is unused.
+    /// Name of the agent preset the planner runs through, so planning happens
+    /// with the same binary, wrapper and environment as the work itself.
+    /// `None` — or a name no preset has — means plain `claude`.
+    #[serde(default)]
+    pub planner_preset: Option<String>,
+    /// Full planner command line; when set it replaces both the preset and
+    /// the default, and the model is unused.
     pub planner_command: String,
-    /// Model for the default planner command.
+    /// Model for the planner, appended as `--model <model>` to whichever
+    /// command the preset (or the default) provides.
     pub planner_model: String,
     pub terminal_font: String,
     pub ui_font: String,
@@ -219,6 +287,7 @@ impl Default for SettingsRecord {
             presets: default_presets(),
             last_preset: 0,
             theme: crate::theme::ThemeMode::default(),
+            planner_preset: None,
             planner_command: String::new(),
             planner_model: crate::planner::DEFAULT_MODEL.to_string(),
             terminal_font: crate::theme::DEFAULT_TERMINAL_FONT.to_string(),
@@ -290,10 +359,14 @@ fn state_file() -> PathBuf {
 
 pub fn load_state() -> AppState {
     let path = state_file();
-    match std::fs::read_to_string(&path) {
+    let mut state: AppState = match std::fs::read_to_string(&path) {
         Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
         Err(_) => AppState::default(),
+    };
+    for preset in &mut state.settings.presets {
+        preset.migrate_resume_command();
     }
+    state
 }
 
 pub fn save_state(state: &AppState) -> Result<()> {
@@ -323,6 +396,56 @@ mod tests {
         assert!(!program_available("/bin"));
         // `~` is never expanded for a directly exec'd command.
         assert!(!program_available("~/bin/sh"));
+    }
+
+    fn preset(command: &str, resume: Option<&str>) -> PresetRecord {
+        PresetRecord {
+            name: "p".into(),
+            command: command.into(),
+            resume_command: resume.map(str::to_string),
+            env: String::new(),
+        }
+    }
+
+    #[test]
+    fn resume_and_planner_commands_are_appended_to_the_one_command() {
+        let plain = preset("claude", None);
+        assert_eq!(plain.resume_command(), "claude --continue");
+        assert_eq!(plain.planner_command("haiku"), "claude -p --model haiku");
+
+        // A wrapper carries its separator in the command, so everything
+        // appended lands on the agent rather than on the wrapper.
+        let wrapped = preset("claude-isol -v /r:/r --", None);
+        assert_eq!(wrapped.resume_command(), "claude-isol -v /r:/r -- --continue");
+        assert_eq!(
+            wrapped.planner_command("haiku"),
+            "claude-isol -v /r:/r -- -p --model haiku"
+        );
+    }
+
+    #[test]
+    fn legacy_resume_commands_migrate_into_the_command() {
+        // Plain duplication: nothing to keep.
+        let mut p = preset("claude", Some("claude --continue"));
+        p.migrate_resume_command();
+        assert_eq!(p.command, "claude");
+        assert_eq!(p.resume_command, None);
+        assert_eq!(p.resume_command(), "claude --continue");
+
+        // The separator between the two is what the wrapper needs, and moves
+        // into the command so spawning passes the task through it too.
+        let mut p = preset(
+            "claude-isol -v /r:/r",
+            Some("claude-isol -v /r:/r -- --continue"),
+        );
+        p.migrate_resume_command();
+        assert_eq!(p.command, "claude-isol -v /r:/r --");
+        assert_eq!(p.resume_command(), "claude-isol -v /r:/r -- --continue");
+
+        // Not expressible: the command is left alone (and a note is logged).
+        let mut p = preset("claude", Some("claude --resume deadbeef"));
+        p.migrate_resume_command();
+        assert_eq!(p.command, "claude");
     }
 
     #[test]

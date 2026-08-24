@@ -28,7 +28,7 @@ name is LLM-derived in every mode** — the planner runs regardless, only its
 workspace decision is overridden. The dialog opens on *Auto* every time: a
 forced workspace applies to the task you are spawning, not to the next one.
 The preset, in contrast, is remembered. A
-preset is a named spawn command, resume command and environment; the defaults cover
+preset is a named command plus an environment; the defaults cover
 plain `claude` plus the sandboxed
 [claude-isol](https://github.com/tehrengruber/claude-container-isolation)
 variants. If planning fails, the error is shown in the dialog and no agent or
@@ -38,8 +38,8 @@ Each agent has its own agent terminal plus any number of shell tabs in the
 same workdir. Shell scrollback is written to disk on exit and replayed above
 the new prompt on the next start, colors included. Terminals are restored
 lazily — nothing spawns until an agent is selected, and its session then
-restarts with the preset's resume command; a *Resume session* button restarts
-it if it exits.
+restarts with the preset's command plus `--continue`; a *Resume session*
+button restarts it if it exits.
 
 Worktrees live under `~/.local/share/harmonium/worktrees/<repo>-<hash>/<branch>`
 and state in `~/.local/share/harmonium/state.json`.
@@ -101,10 +101,29 @@ for that run**, which is handy for one-off experiments.
 | --- | --- | --- | --- |
 | `HARMONIUM_PLANNER_CMD` | Planner ▸ Command | `claude -p --model haiku` | Planner command line; the planning prompt is appended as the last argument. Haiku is the default because planning is a tiny classification task — a `claude -p` call boots a full Claude Code session (~15–19K tokens of scaffolding), which costs ~$0.14 on a premium model but ~$0.003 on haiku with a warm prompt cache. |
 | `HARMONIUM_PLANNER_MODEL` | Planner ▸ Model | `haiku` | Sets just the planner's `--model`, keeping the default `claude -p` command. A planner command takes precedence: setting both env vars is an error, and in the dialog the model is marked unused while a command is set. |
+| – | Planner ▸ Preset | `Default (claude)` | Runs the planner through one of the agent presets, so planning uses the same binary, wrapper and environment as the work — pick the sandboxed preset and planning happens inside the sandbox. The preset's command gets `-p --model <model>` and the prompt appended. Settings-only; a planner command overrides it. |
 | `HARMONIUM_TERMINAL_FONT` | Fonts ▸ Terminal | `DejaVu Sans Mono` | Terminal font family. Applies immediately on save. |
 | `HARMONIUM_UI_FONT` | Fonts ▸ UI | `DejaVu Sans` | UI font family. Applies immediately on save. |
 | `HARMONIUM_DATA_DIR` | – | `~/.local/share/harmonium` | State + worktrees. Env-only: it decides where `state.json` itself lives. |
 | `HARMONIUM_AGENT_BIN` | – | – | Replaces the preset command entirely (testing). Env-only. |
+
+### Presets
+
+A preset is one **Command** and one **Env**. Everything else is appended to the
+command as further arguments: the task text when spawning, `--continue` when
+resuming, and `-p --model <model>` plus the prompt when the preset is used for
+planning. There is deliberately no second command line to keep in sync.
+
+A wrapper that needs a separator before the agent's own flags carries it in the
+command — which is why the shipped `claude-isol` presets end in `--`:
+
+```
+claude-isol -v $HARMONIUM_TASK_GIT_ROOT:$HARMONIUM_TASK_GIT_ROOT --
+```
+
+so spawning runs `claude-isol … -- <task>` and resuming `claude-isol … --
+--continue`. The resume flag is fixed at `--continue`; an agent CLI that spells
+it differently can't be expressed as a preset today.
 
 ### Preset environment
 
@@ -130,8 +149,8 @@ CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude
 ```
 
 The difference is reach — a prefix applies only to the process that command
-starts, so it has to be repeated in the resume command and never reaches the
-shell tabs — and precedence: a prefix wins over an Env entry of the same name,
+starts, so it never reaches the shell tabs or the planner — and precedence: a
+prefix wins over an Env entry of the same name,
 which in turn wins over a task variable.
 
 That first variable is worth knowing about: the claude CLI normally runs on the

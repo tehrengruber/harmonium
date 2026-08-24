@@ -12,7 +12,7 @@ use gpui::{
     TitlebarOptions, WindowBounds, WindowOptions,
 };
 
-actions!(harmonium, [Quit, NewTerminalTab]);
+actions!(harmonium, [Quit, NewTerminalTab, SearchTerminal]);
 
 fn main() {
     env_logger::init();
@@ -66,6 +66,15 @@ fn main() {
         cx.bind_keys([KeyBinding::new(
             "ctrl-shift-t",
             NewTerminalTab,
+            Some("!TextInput"),
+        )]);
+
+        // Search the visible terminal's scrollback. Bound everywhere *except*
+        // a focused text field, so it can't fire while the search box itself
+        // has the keyboard.
+        cx.bind_keys([KeyBinding::new(
+            "ctrl-shift-f",
+            SearchTerminal,
             Some("!TextInput"),
         )]);
 

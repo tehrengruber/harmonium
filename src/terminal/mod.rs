@@ -7,10 +7,11 @@ pub mod view;
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
+use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags as CellFlags;
+use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Rgb as AnsiRgb};
@@ -158,6 +159,41 @@ impl SelectionState {
         self.start.line = Line(self.start.line.0 - delta);
         self.end.line = Line(self.end.line.0 - delta);
     }
+}
+
+/// What a search should do, as configured in the search dialog.
+#[derive(Clone, Copy, Debug)]
+pub struct SearchOptions {
+    /// Search towards the end of the scrollback rather than the start.
+    pub forward: bool,
+    /// `Foo` and `foo` are different strings.
+    pub match_case: bool,
+    /// Continue from the other end when the last match is passed.
+    pub wrap: bool,
+}
+
+/// The result of one search step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchOutcome {
+    /// Selected a match; `wrapped` if it came from the other end.
+    Found { wrapped: bool },
+    /// The query appears nowhere in the scrollback.
+    NoMatch,
+    /// There are matches, but only behind us, and wrapping is off.
+    EndOfBuffer,
+}
+
+/// Escape a literal so it can be used as a search regex.
+fn escape_regex(query: &str) -> String {
+    const SPECIAL: &str = r"\.+*?()|[]{}^$#&-~";
+    let mut escaped = String::with_capacity(query.len());
+    for c in query.chars() {
+        if SPECIAL.contains(c) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 pub struct Terminal {
@@ -552,6 +588,89 @@ impl Terminal {
         } else {
             false
         }
+    }
+
+    // ---- Search ----
+
+    /// Find `query` in the scrollback and select the match, scrolling it into
+    /// view. Searching continues from the current selection — which is where
+    /// the previous match left it — so repeated calls walk through the
+    /// matches, and a click elsewhere resumes from there instead.
+    pub fn search(
+        &mut self,
+        query: &str,
+        options: SearchOptions,
+        cx: &mut Context<Self>,
+    ) -> Result<SearchOutcome> {
+        if query.is_empty() {
+            return Ok(SearchOutcome::NoMatch);
+        }
+        // alacritty applies smart case (insensitive unless the query has an
+        // uppercase letter), which is not a setting the user chose. Inline
+        // flags override it in both directions, and escaping keeps the query
+        // literal — this is a search box, not a regex console.
+        let pattern = format!(
+            "{}{}",
+            if options.match_case { "(?-i)" } else { "(?i)" },
+            escape_regex(query)
+        );
+        let mut regex = RegexSearch::new(&pattern)
+            .map_err(|error| anyhow::anyhow!("invalid search pattern: {error}"))?;
+
+        // Align our selection with any output that arrived since the last
+        // frame, so the origin below refers to the right cells.
+        self.sync_selection();
+        let term = self.term.clone();
+        let mut term = term.lock();
+
+        let direction = if options.forward {
+            Direction::Right
+        } else {
+            Direction::Left
+        };
+        let display_offset = term.grid().display_offset() as i32;
+        let last_line = Line(term.screen_lines() as i32 - display_offset - 1);
+        let last_column = Column(term.columns().saturating_sub(1));
+        let origin = match (&self.selection, options.forward) {
+            // Just past the current match, so it isn't found again.
+            (Some(state), true) => {
+                GridPoint::new(state.end.line, state.end.column).add(&*term, Boundary::Grid, 1)
+            }
+            (Some(state), false) => {
+                GridPoint::new(state.start.line, state.start.column).sub(&*term, Boundary::Grid, 1)
+            }
+            // Nothing selected: start from the edge of what's on screen.
+            (None, true) => GridPoint::new(Line(-display_offset), Column(0)),
+            (None, false) => GridPoint::new(last_line, last_column),
+        };
+
+        // `search_next` always wraps, so wrapping is detected rather than
+        // requested: a match that landed behind us is one that came around.
+        let Some(found) = term.search_next(&mut regex, origin, direction, Side::Left, None) else {
+            return Ok(SearchOutcome::NoMatch);
+        };
+        let wrapped = if options.forward {
+            *found.start() < origin
+        } else {
+            *found.start() > origin
+        };
+        if wrapped && !options.wrap {
+            return Ok(SearchOutcome::EndOfBuffer);
+        }
+
+        self.selection = Some(SelectionState {
+            ty: SelectionType::Simple,
+            start: *found.start(),
+            start_side: Side::Left,
+            end: *found.end(),
+            end_side: Side::Right,
+        });
+        self.selection_history = term.history_size();
+        term.selection = self.selection.as_ref().map(|state| state.build());
+        term.scroll_to_point(*found.start());
+        drop(term);
+        cx.notify();
+        Ok(SearchOutcome::Found { wrapped })
     }
 
     // ---- Mouse selection ----
@@ -1152,3 +1271,30 @@ pub fn rgb_to_hsla(rgb: AnsiRgb) -> gpui::Hsla {
     .into()
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_queries_are_literal() {
+        // A search box is not a regex console: metacharacters match themselves.
+        assert_eq!(escape_regex("a.b"), r"a\.b");
+        assert_eq!(escape_regex("cargo build --release"), r"cargo build \-\-release");
+        assert_eq!(escape_regex("fn main()"), r"fn main\(\)");
+        assert_eq!(escape_regex(r"C:\tmp"), r"C:\\tmp");
+        assert_eq!(escape_regex("plain"), "plain");
+    }
+
+    #[test]
+    fn escaped_queries_build_a_usable_regex() {
+        // Both case modes, on input that would otherwise be a broken pattern.
+        for prefix in ["(?i)", "(?-i)"] {
+            let pattern = format!("{prefix}{}", escape_regex("error[E0027]: *"));
+            assert!(
+                RegexSearch::new(&pattern).is_ok(),
+                "pattern `{pattern}` should compile"
+            );
+        }
+    }
+}

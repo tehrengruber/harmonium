@@ -40,6 +40,17 @@ enum Dialog {
         error: Option<String>,
         _subscription: Subscription,
     },
+    /// Search the visible terminal's scrollback. Matches are shown by
+    /// selecting them, so the dialog stays out of the way of the terminal
+    /// itself and the usual copy shortcut works on whatever it found.
+    Search {
+        input: Entity<TextInput>,
+        match_case: bool,
+        wrap: bool,
+        /// Result of the last search — "no matches", "wrapped", …
+        status: Option<String>,
+        _subscription: Subscription,
+    },
     Settings {
         /// Focus target for the panel itself, so the modal always owns the
         /// keyboard even when it has no input to focus (no presets yet).
@@ -1141,6 +1152,109 @@ impl Workspace {
             return;
         };
         self.add_next_shell_tab(agent_id, window, cx);
+    }
+
+    // ---- Terminal search ----
+
+    fn search_terminal(
+        &mut self,
+        _: &crate::SearchTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_search_dialog(window, cx);
+    }
+
+    fn open_search_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Nothing to search in without a live terminal on screen.
+        if self.selected.as_ref().and_then(|id| self.active_terminal(id)).is_none() {
+            self.set_status("No terminal to search".into(), true, cx);
+            return;
+        }
+        // Reopening keeps the previous query and options; only the focus and
+        // the stale result line are reset.
+        if let Some(Dialog::Search { input, status, .. }) = &mut self.dialog {
+            *status = None;
+            let input = input.clone();
+            input.update(cx, |input, cx| input.select_all_text(cx));
+            window.focus(&input.focus_handle(cx));
+            cx.notify();
+            return;
+        }
+        let input = cx.new(|cx| TextInput::new("Find in terminal…", cx));
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            move |this, _input, event: &InputEvent, window, cx| match event {
+                // Enter walks forward through the matches.
+                InputEvent::Submitted(_) => this.find_in_terminal(true, cx),
+                InputEvent::Cancelled => this.close_dialog(window, cx),
+            },
+        );
+        window.focus(&input.focus_handle(cx));
+        self.dialog = Some(Dialog::Search {
+            input,
+            match_case: false,
+            wrap: true,
+            status: None,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// Run one search step against the terminal the user is looking at.
+    fn find_in_terminal(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(Dialog::Search {
+            input,
+            match_case,
+            wrap,
+            ..
+        }) = &self.dialog
+        else {
+            return;
+        };
+        let query = input.read(cx).text().to_string();
+        let options = crate::terminal::SearchOptions {
+            forward,
+            match_case: *match_case,
+            wrap: *wrap,
+        };
+        let Some(view) = self
+            .selected
+            .clone()
+            .and_then(|id| self.active_terminal(&id))
+            .cloned()
+        else {
+            return;
+        };
+        let terminal = view.read(cx).terminal.clone();
+        let outcome = terminal.update(cx, |terminal, cx| terminal.search(&query, options, cx));
+        let message = match outcome {
+            Ok(crate::terminal::SearchOutcome::Found { wrapped: true }) => {
+                Some(if forward {
+                    "Wrapped to the top".to_string()
+                } else {
+                    "Wrapped to the bottom".to_string()
+                })
+            }
+            Ok(crate::terminal::SearchOutcome::Found { wrapped: false }) => None,
+            Ok(crate::terminal::SearchOutcome::NoMatch) => {
+                (!query.is_empty()).then(|| format!("No matches for `{query}`"))
+            }
+            Ok(crate::terminal::SearchOutcome::EndOfBuffer) => Some(
+                if forward {
+                    "No more matches below — turn on Wrap around"
+                } else {
+                    "No more matches above — turn on Wrap around"
+                }
+                .to_string(),
+            ),
+            Err(error) => Some(format!("{error:#}")),
+        };
+        if let Some(Dialog::Search { status, .. }) = &mut self.dialog {
+            *status = message;
+        }
+        cx.notify();
     }
 
     /// Spawn a fresh shell in the agent's workdir for a new terminal tab.
@@ -2654,6 +2768,129 @@ impl Workspace {
                 .into_any_element()
             }
 
+            Dialog::Search {
+                input,
+                match_case,
+                wrap,
+                status,
+                ..
+            } => {
+                // One toggle chip, styled like the preset/workspace chips.
+                let toggle = |id: &'static str, label: &'static str, on: bool| {
+                    div()
+                        .id(id)
+                        .px_2()
+                        .py_0p5()
+                        .rounded_sm()
+                        .text_sm()
+                        .cursor_pointer()
+                        .bg(if on {
+                            theme::accent()
+                        } else {
+                            theme::selected_bg()
+                        })
+                        .text_color(if on { theme::panel_bg() } else { theme::fg() })
+                        .hover(|s| s.opacity(0.85))
+                        .child(label)
+                };
+                let mut panel = div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .w(px(460.))
+                    .p_4()
+                    .rounded_sm()
+                    .bg(theme::panel_bg())
+                    .border_1()
+                    .border_color(theme::border())
+                    .child(div().text_color(theme::fg()).child("Find in terminal"))
+                    .child(input.clone())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                toggle("search-match-case", "Match case", *match_case).on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        if let Some(Dialog::Search { match_case, .. }) =
+                                            &mut this.dialog
+                                        {
+                                            *match_case = !*match_case;
+                                        }
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                toggle("search-wrap", "Wrap around", *wrap).on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        if let Some(Dialog::Search { wrap, .. }) = &mut this.dialog {
+                                            *wrap = !*wrap;
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    );
+
+                if let Some(status) = status {
+                    panel = panel.child(
+                        div()
+                            .text_color(theme::fg_dim())
+                            .text_sm()
+                            .child(SharedString::from(status.clone())),
+                    );
+                }
+
+                let button = |id: &'static str, label: &'static str, primary: bool| {
+                    div()
+                        .id(id)
+                        .px_3()
+                        .py_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .bg(if primary {
+                            theme::accent()
+                        } else {
+                            theme::selected_bg()
+                        })
+                        .text_color(if primary { theme::panel_bg() } else { theme::fg() })
+                        .hover(|s| s.opacity(0.9))
+                        .child(label)
+                };
+                panel
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("search-close")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_color(theme::fg_dim())
+                                    .hover(|s| s.text_color(theme::fg()))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_dialog(window, cx);
+                                    }))
+                                    .child("Close"),
+                            )
+                            .child(button("search-prev", "Previous", false).on_click(
+                                cx.listener(|this, _, _, cx| this.find_in_terminal(false, cx)),
+                            ))
+                            .child(button("search-next", "Next", true).on_click(cx.listener(
+                                |this, _, _, cx| this.find_in_terminal(true, cx),
+                            ))),
+                    )
+                    .into_any_element()
+            }
+
             Dialog::Settings {
                 focus_handle,
                 planner_command,
@@ -2891,6 +3128,7 @@ impl Workspace {
                     }
                 }
             }
+            Some(Dialog::Search { .. }) => self.find_in_terminal(true, cx),
             Some(Dialog::Settings { .. }) => self.save_settings(window, cx),
             None => {}
         }
@@ -3084,6 +3322,7 @@ impl Render for Workspace {
             .text_size(theme::ui_font_size(cx))
             .font_family(theme::ui_font().family.clone())
             .on_action(cx.listener(Self::new_terminal_tab))
+            .on_action(cx.listener(Self::search_terminal))
             .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
                 if this.resizing_sidebar {
                     if event.pressed_button == Some(gpui::MouseButton::Left) {

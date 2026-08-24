@@ -71,6 +71,14 @@ Only the parts that aren't obvious from the UI:
 - `ctrl-shift-t` opens a new shell tab for the selected agent — the `+` in the
   tab bar. It works while a terminal has the keyboard, but not while a dialog
   field does.
+- `ctrl-shift-f` searches the visible terminal's scrollback, including the
+  part scrolled out of view. `enter` (or *Next*) walks forward, *Previous*
+  walks back, `escape` closes. **Match case** overrides the usual smart-case
+  behaviour; **Wrap around** (on by default) continues from the other end,
+  and with it off the search stops at the last match and says so. The query
+  is a literal, not a regex. Each match is *selected*, so it stays visible
+  after closing the dialog and `ctrl-shift-c` copies it; searching again
+  continues from that selection, so clicking elsewhere resumes from there.
 - `ctrl-q` quits.
 
 ## Configuration

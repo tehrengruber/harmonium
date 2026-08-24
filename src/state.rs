@@ -72,6 +72,10 @@ impl ProjectRecord {
 
 /// Which workspace a new agent gets. The task description always decides the
 /// agent's *name*; this only decides where it works.
+///
+/// Deliberately not persisted: the spawn dialog opens on `Auto` every time.
+/// Forcing a workspace is a decision about one task, so carrying it over to
+/// the next one would quietly put work in the wrong place.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceMode {
@@ -192,8 +196,6 @@ pub struct SettingsRecord {
     /// Index of the preset last used to spawn an agent (preselected in the
     /// spawn dialog).
     pub last_preset: usize,
-    /// Workspace choice last used to spawn an agent, likewise preselected.
-    pub last_workspace_mode: WorkspaceMode,
     pub theme: crate::theme::ThemeMode,
     /// Full planner command line; when set it replaces the default
     /// `claude -p --model <planner_model>` and the model is unused.
@@ -216,7 +218,6 @@ impl Default for SettingsRecord {
             sidebar_collapsed: false,
             presets: default_presets(),
             last_preset: 0,
-            last_workspace_mode: WorkspaceMode::default(),
             theme: crate::theme::ThemeMode::default(),
             planner_command: String::new(),
             planner_model: crate::planner::DEFAULT_MODEL.to_string(),

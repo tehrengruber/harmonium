@@ -743,7 +743,10 @@ impl Workspace {
             input,
             planning: false,
             preset,
-            workspace_mode: self.state.settings.last_workspace_mode,
+            // Always Auto, never the last choice: forcing a workspace is a
+            // decision about *one* task, and inheriting it silently would put
+            // the next task somewhere it wasn't meant to go.
+            workspace_mode: WorkspaceMode::Auto,
             error: None,
             _subscription: subscription,
         });
@@ -1004,7 +1007,7 @@ impl Workspace {
             workspace_mode = *mode;
         } else {
             preset_index = self.state.settings.last_preset;
-            workspace_mode = self.state.settings.last_workspace_mode;
+            workspace_mode = WorkspaceMode::Auto;
         }
         let preset = self
             .state
@@ -1019,7 +1022,6 @@ impl Workspace {
                 env: String::new(),
             });
         self.state.settings.last_preset = preset_index;
-        self.state.settings.last_workspace_mode = workspace_mode;
         self.persist(cx);
         cx.notify();
 

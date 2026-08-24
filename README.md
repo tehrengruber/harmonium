@@ -25,8 +25,9 @@ of its own, keeping the branch name the LLM suggested (or deriving one from
 the agent's name when it wanted the base checkout). *Main branch* always uses
 the project's own checkout, with no branch or worktree of its own. **The agent
 name is LLM-derived in every mode** — the planner runs regardless, only its
-workspace decision is overridden — and the choice is remembered for the next
-spawn. A
+workspace decision is overridden. The dialog opens on *Auto* every time: a
+forced workspace applies to the task you are spawning, not to the next one.
+The preset, in contrast, is remembered. A
 preset is a named spawn command, resume command and environment; the defaults cover
 plain `claude` plus the sandboxed
 [claude-isol](https://github.com/tehrengruber/claude-container-isolation)

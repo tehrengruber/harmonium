@@ -117,6 +117,11 @@ fn max_scroll(text_width: Pixels, field_width: Pixels) -> Pixels {
     (text_width + CARET_WIDTH - field_width).max(px(0.))
 }
 
+/// Height of a multiline field, in rows: it starts at the minimum and grows
+/// with the text up to the maximum, after which it scrolls.
+const MIN_MULTILINE_ROWS: usize = 3;
+const MAX_MULTILINE_ROWS: usize = 12;
+
 pub struct TextInput {
     focus_handle: FocusHandle,
     content: SharedString,
@@ -128,11 +133,13 @@ pub struct TextInput {
     last_layout: Option<LayoutInfo>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
-    /// How far the single-line view is scrolled to the right, in pixels. Text
-    /// wider than the field is clipped, not shrunk, so this is what makes the
-    /// overflow reachable: the caret drags it along, and the wheel scrolls it
-    /// without moving the caret. Always zero in multiline mode, which wraps.
-    scroll_offset: Pixels,
+    /// How far the view is scrolled away from the text's origin. Overflow is
+    /// clipped, not shrunk, so this is what makes it reachable: the caret
+    /// drags the view along, and the wheel moves it without moving the caret.
+    /// Single-line fields scroll horizontally (they never wrap); multiline
+    /// fields wrap and so scroll vertically once they hit their maximum
+    /// height. Only ever one axis at a time; the other stays zero.
+    scroll_offset: Point<Pixels>,
     /// Set whenever the caret moves or the text changes: the next paint scrolls
     /// it back into view. Cleared there, so a wheel scroll that deliberately
     /// looks away isn't yanked back on the following frame.
@@ -162,7 +169,7 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
-            scroll_offset: px(0.),
+            scroll_offset: point(px(0.), px(0.)),
             scroll_to_cursor: true,
         }
     }
@@ -175,7 +182,7 @@ impl TextInput {
         // Show the beginning even though the caret lands at the end: a field
         // filled in by the app (a preset command, a path) is there to be read
         // first, and any edit scrolls the caret back into view anyway.
-        self.scroll_offset = px(0.);
+        self.scroll_offset = point(px(0.), px(0.));
         self.scroll_to_cursor = false;
         cx.notify();
     }
@@ -334,23 +341,42 @@ impl TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.multiline {
-            return;
-        }
         let delta = event.delta.pixel_delta(window.line_height());
-        let delta = if delta.x == px(0.) { delta.y } else { delta.x };
-        let target = (self.scroll_offset - delta).clamp(px(0.), self.max_scroll_offset());
-        if target == self.scroll_offset {
+        // Single-line fields have only one axis to give, so either wheel
+        // direction drives it; multiline scrolls vertically like any text.
+        let delta = if self.multiline {
+            delta.y
+        } else if delta.x == px(0.) {
+            delta.y
+        } else {
+            delta.x
+        };
+        let current = self.scroll_along_axis();
+        let target = (current - delta).clamp(px(0.), self.max_scroll_offset());
+        if target == current {
             // Nothing to pan here — let the event bubble so the surrounding
             // dialog scrolls instead, which is what the user meant.
             return;
         }
-        self.scroll_offset = target;
+        if self.multiline {
+            self.scroll_offset.y = target;
+        } else {
+            self.scroll_offset.x = target;
+        }
         self.scroll_to_cursor = false;
         // A field that *did* pan swallows the event: scrolling inside an input
         // must not also scroll the dialog behind it.
         cx.stop_propagation();
         cx.notify();
+    }
+
+    /// The scroll offset along whichever axis this field scrolls on.
+    fn scroll_along_axis(&self) -> Pixels {
+        if self.multiline {
+            self.scroll_offset.y
+        } else {
+            self.scroll_offset.x
+        }
     }
 
     /// Scroll limit from the last painted layout. Prepaint recomputes this from
@@ -360,6 +386,9 @@ impl TextInput {
         else {
             return px(0.);
         };
+        if self.multiline {
+            return (layout.total_height() - bounds.size.height).max(px(0.));
+        }
         let text_width = layout
             .lines
             .first()
@@ -425,7 +454,7 @@ impl TextInput {
     /// Window position → position within the shaped text, undoing both the
     /// element's origin and the horizontal scroll.
     fn text_position(&self, position: Point<Pixels>, bounds: &Bounds<Pixels>) -> Point<Pixels> {
-        position - bounds.origin + point(self.scroll_offset, px(0.))
+        position - bounds.origin + self.scroll_offset
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -602,7 +631,7 @@ impl EntityInputHandler for TextInput {
         let end = layout.position_for_index(range.end)?;
         // Where the range is *painted*: the IME candidate window must follow
         // the scrolled text, not the unscrolled layout.
-        let origin = bounds.origin - point(self.scroll_offset, px(0.));
+        let origin = bounds.origin - self.scroll_offset;
         Some(Bounds::from_corners(
             origin + start,
             origin + end + point(px(0.), layout.line_height),
@@ -760,7 +789,12 @@ impl gpui::Element for TextElement {
                     input.content.clone()
                 };
                 let font_size = text_style.font_size.to_pixels(window.rem_size());
-                let line_height = window.line_height();
+                // From the *captured* style, not `window.line_height()`: this
+                // closure runs during layout, outside the element's style
+                // context, where the window would answer with the default
+                // rem-based line height. Measuring rows taller than they are
+                // painted left a growing band of dead space under the text.
+                let line_height = text_style.line_height_in_pixels(window.rem_size());
                 let runs = [TextRun {
                     len: display_text.len(),
                     font: text_style.font(),
@@ -771,7 +805,16 @@ impl gpui::Element for TextElement {
                 }];
                 let layout =
                     shape_layout(&display_text, &runs, font_size, line_height, width, window);
-                let min_height = line_height * 3.;
+                // Grow with the text, but only so far: past this the field
+                // scrolls instead. Unbounded growth pushed the dialog's own
+                // buttons off the bottom of the window, so a long task could
+                // be typed but not submitted.
+                let min_height = line_height * MIN_MULTILINE_ROWS as f32;
+                // Also bounded by the window, so a short window doesn't hide
+                // the dialog's buttons behind a field that fits its 12 rows.
+                let max_height = (line_height * MAX_MULTILINE_ROWS as f32)
+                    .min(window.viewport_size().height * 0.5)
+                    .max(min_height);
                 size(
                     width.unwrap_or_else(|| {
                         layout
@@ -780,7 +823,7 @@ impl gpui::Element for TextElement {
                             .map(|l| l.size(line_height).width)
                             .fold(px(0.), |a, b| a.max(b))
                     }),
-                    layout.total_height().max(min_height),
+                    layout.total_height().clamp(min_height, max_height),
                 )
             },
         );
@@ -825,28 +868,42 @@ impl gpui::Element for TextElement {
             window,
         );
 
-        // Single-line text is never wrapped or shrunk, so a long value runs
-        // past the field: pan it instead. Multiline wraps, so it stays at 0.
+        // Overflow is panned, not shrunk, along whichever axis this field can
+        // overflow on: single-line text never wraps and so runs off the right,
+        // multiline wraps and so runs off the bottom once it has grown to its
+        // maximum height.
+        let caret = scroll_to_cursor
+            .then(|| layout.position_for_index(cursor_offset))
+            .flatten();
         if multiline {
-            scroll_offset = px(0.);
+            let limit = (layout.total_height() - bounds.size.height).max(px(0.));
+            let mut offset = scroll_offset.y.clamp(px(0.), limit);
+            if let Some(caret) = caret {
+                if caret.y < offset {
+                    offset = caret.y;
+                } else if caret.y + line_height > offset + bounds.size.height {
+                    offset = caret.y + line_height - bounds.size.height;
+                }
+            }
+            scroll_offset = point(px(0.), offset.clamp(px(0.), limit));
         } else {
             let text_width = layout
                 .lines
                 .first()
                 .map(|line| line.size(line_height).width)
                 .unwrap_or_default();
-            scroll_offset = scroll_offset.clamp(px(0.), max_scroll(text_width, bounds.size.width));
-            if scroll_to_cursor {
-                if let Some(position) = layout.position_for_index(cursor_offset) {
-                    if position.x < scroll_offset {
-                        scroll_offset = position.x;
-                    } else if position.x + CARET_WIDTH > scroll_offset + bounds.size.width {
-                        scroll_offset = position.x + CARET_WIDTH - bounds.size.width;
-                    }
+            let limit = max_scroll(text_width, bounds.size.width);
+            let mut offset = scroll_offset.x.clamp(px(0.), limit);
+            if let Some(caret) = caret {
+                if caret.x < offset {
+                    offset = caret.x;
+                } else if caret.x + CARET_WIDTH > offset + bounds.size.width {
+                    offset = caret.x + CARET_WIDTH - bounds.size.width;
                 }
             }
+            scroll_offset = point(offset, px(0.));
         }
-        let origin = bounds.origin - point(scroll_offset, px(0.));
+        let origin = bounds.origin - scroll_offset;
         self.input.update(cx, |input, _cx| {
             input.scroll_offset = scroll_offset;
             input.scroll_to_cursor = false;

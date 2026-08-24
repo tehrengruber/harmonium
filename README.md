@@ -44,13 +44,14 @@ it if it exits.
 Worktrees live under `~/.local/share/harmonium/worktrees/<repo>-<hash>/<branch>`
 and state in `~/.local/share/harmonium/state.json`.
 
-**One task per worktree.** Git allows a branch to be checked out in only one
+**One task per directory.** Git allows a branch to be checked out in only one
 worktree, so a plan naming a branch that another agent already occupies would
-drop the new task into that agent's directory. Spawning is refused instead,
-with the dialog left open and the incumbent named, so you can resume that task
-or reword this one onto a different branch. The project's own checkout is
-exempt: sharing it is what base mode *is*, so several *Main branch* tasks may
-run there at once.
+drop the new task into that agent's directory; the project's own checkout can
+collide the same way when two tasks both want *Main branch*. Spawning is
+refused in either case, with the dialog left open and the occupying task
+**named**, so you can resume it instead — or, if you meant a second task,
+reword this one onto a different branch (when the clash is on a branch) or
+pick *New worktree* (when it is on the main checkout).
 
 Removing an agent (the `×` in the sidebar) deletes its worktree too, but only
 if that worktree is **clean** — staged, modified or untracked files block the

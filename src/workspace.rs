@@ -1053,18 +1053,31 @@ impl Workspace {
                 // rather than in the planner, because "taken" is a fact about
                 // harmonium's agents, not about the repository.
                 let outcome = match result {
-                    Ok(workspace) => match this.occupant_of(&repo, &workspace) {
-                        // Not "use New worktree": that mode keeps the branch
-                        // the planner named, so it would land here again. A
-                        // different branch is what's needed, and the branch
-                        // comes from the description.
-                        Some(existing) => Err(format!(
-                            "`{}` is already working on `{}` in {} — resume that task, or \
-                             describe this one so it lands on a different branch",
-                            existing.name,
-                            workspace.branch.as_deref().unwrap_or("(no branch)"),
-                            workspace.workdir.display()
-                        )),
+                    Ok(workspace) => match this.occupant_of(&workspace) {
+                        Some(existing) => {
+                            // The way out differs by where the collision is.
+                            // On a branch, "New worktree" is no help: it keeps
+                            // the branch the planner named and would land here
+                            // again, so the description has to change. On the
+                            // main checkout, a worktree is exactly the fix.
+                            let (place, advice) = match &workspace.branch {
+                                Some(branch) => (
+                                    format!("on `{branch}` in {}", workspace.workdir.display()),
+                                    "describe this one so it lands on a different branch",
+                                ),
+                                None => (
+                                    format!(
+                                        "in the project checkout {}",
+                                        workspace.workdir.display()
+                                    ),
+                                    "spawn this one with New worktree",
+                                ),
+                            };
+                            Err(format!(
+                                "`{}` is already working {place} — resume that task, or {advice}",
+                                existing.name
+                            ))
+                        }
                         None => Ok(workspace),
                     },
                     Err(spawn_error) => Err(format!("{spawn_error:#}")),
@@ -1096,14 +1109,11 @@ impl Workspace {
         .detach();
     }
 
-    /// The agent already working in `workspace`, if any. Only worktrees can be
-    /// occupied: the project's own checkout is shared by design — that is what
-    /// base mode *is*, and picking "Main branch" says so deliberately — so
-    /// several base-mode agents there stay allowed.
-    fn occupant_of(&self, repo: &Path, workspace: &planner::Workspace) -> Option<&AgentRecord> {
-        if workspace.branch.is_none() || workspace.workdir == repo {
-            return None;
-        }
+    /// The agent already working in `workspace`, if any. One task per
+    /// directory, the project's own checkout included: two agents editing the
+    /// same files is the hazard, and it doesn't get safer just because the
+    /// directory happens to be the main checkout rather than a worktree.
+    fn occupant_of(&self, workspace: &planner::Workspace) -> Option<&AgentRecord> {
         self.state
             .projects
             .iter()

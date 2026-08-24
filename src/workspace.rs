@@ -1047,15 +1047,37 @@ impl Workspace {
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
-                match result {
+                // One task per worktree: git allows one worktree per branch,
+                // so a plan naming a branch that is already checked out lands
+                // in the directory another agent is working in. Refused here
+                // rather than in the planner, because "taken" is a fact about
+                // harmonium's agents, not about the repository.
+                let outcome = match result {
+                    Ok(workspace) => match this.occupant_of(&repo, &workspace) {
+                        // Not "use New worktree": that mode keeps the branch
+                        // the planner named, so it would land here again. A
+                        // different branch is what's needed, and the branch
+                        // comes from the description.
+                        Some(existing) => Err(format!(
+                            "`{}` is already working on `{}` in {} — resume that task, or \
+                             describe this one so it lands on a different branch",
+                            existing.name,
+                            workspace.branch.as_deref().unwrap_or("(no branch)"),
+                            workspace.workdir.display()
+                        )),
+                        None => Ok(workspace),
+                    },
+                    Err(spawn_error) => Err(format!("{spawn_error:#}")),
+                };
+                match outcome {
                     Ok(workspace) => {
                         this.dialog = None;
                         this.finish_spawn(repo, task, workspace, preset, window, cx);
                     }
-                    Err(spawn_error) => {
+                    Err(message) => {
                         // Keep the dialog open so the task text isn't lost;
                         // show the error inline for a retry.
-                        let message = format!("{spawn_error:#}");
+                        log::error(message.clone());
                         if let Some(Dialog::NewAgent {
                             planning, error, ..
                         }) = &mut this.dialog
@@ -1072,6 +1094,21 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    /// The agent already working in `workspace`, if any. Only worktrees can be
+    /// occupied: the project's own checkout is shared by design — that is what
+    /// base mode *is*, and picking "Main branch" says so deliberately — so
+    /// several base-mode agents there stay allowed.
+    fn occupant_of(&self, repo: &Path, workspace: &planner::Workspace) -> Option<&AgentRecord> {
+        if workspace.branch.is_none() || workspace.workdir == repo {
+            return None;
+        }
+        self.state
+            .projects
+            .iter()
+            .flat_map(|project| project.agents.iter())
+            .find(|agent| agent.workdir == workspace.workdir)
     }
 
     fn finish_spawn(

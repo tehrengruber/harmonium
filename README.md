@@ -44,14 +44,22 @@ it if it exits.
 Worktrees live under `~/.local/share/harmonium/worktrees/<repo>-<hash>/<branch>`
 and state in `~/.local/share/harmonium/state.json`.
 
+**One task per worktree.** Git allows a branch to be checked out in only one
+worktree, so a plan naming a branch that another agent already occupies would
+drop the new task into that agent's directory. Spawning is refused instead,
+with the dialog left open and the incumbent named, so you can resume that task
+or reword this one onto a different branch. The project's own checkout is
+exempt: sharing it is what base mode *is*, so several *Main branch* tasks may
+run there at once.
+
 Removing an agent (the `×` in the sidebar) deletes its worktree too, but only
 if that worktree is **clean** — staged, modified or untracked files block the
 removal with a message naming the directory, since killing the session and
 deleting the checkout has no undo. Ignored files (build output) don't count.
 The **branch is kept**, so anything committed there survives and a later task
 on the same branch picks up where this one left off. Nothing is deleted for a
-base-mode agent (it runs in the project's own checkout) or when a second agent
-shares the same worktree.
+base-mode agent (it runs in the project's own checkout), or in the case a
+state file from before the rule above still has two agents sharing a worktree.
 
 ## Keyboard & mouse
 

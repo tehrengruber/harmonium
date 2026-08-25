@@ -745,7 +745,7 @@ impl Workspace {
                 }
             },
         );
-        window.focus(&input.focus_handle(cx));
+        let focus = input.focus_handle(cx);
         let preset = self
             .state
             .settings
@@ -763,7 +763,10 @@ impl Workspace {
             error: None,
             _subscription: subscription,
         });
+        // After presenting, never before: opening the dialog layer focuses
+        // the dialog itself, which would take the keyboard off the field.
         self.present_dialog(px(560.), window, cx);
+        window.focus(&focus);
     }
 
     // ---- Settings ----
@@ -875,10 +878,10 @@ impl Workspace {
             cx,
         );
         let focus_handle = cx.focus_handle();
-        match preset_inputs.first() {
-            Some(first) => window.focus(&first.name.focus_handle(cx)),
-            None => window.focus(&focus_handle),
-        }
+        let focus = match preset_inputs.first() {
+            Some(first) => first.name.focus_handle(cx),
+            None => focus_handle.clone(),
+        };
         let planner_preset_row = self.state.settings.planner_preset.as_deref().and_then(|name| {
             self.state
                 .settings
@@ -897,6 +900,7 @@ impl Workspace {
             _subscriptions: subscriptions,
         });
         self.present_dialog(px(620.), window, cx);
+        window.focus(&focus);
     }
 
     fn add_preset_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1303,7 +1307,7 @@ impl Workspace {
                 _ => {}
             },
         );
-        window.focus(&input.focus_handle(cx));
+        let focus = input.focus_handle(cx);
         self.dialog = Some(Dialog::Search {
             input,
             match_case: false,
@@ -1312,6 +1316,7 @@ impl Workspace {
             _subscription: subscription,
         });
         self.present_dialog(px(460.), window, cx);
+        window.focus(&focus);
     }
 
     /// Run one search step against the terminal the user is looking at.
@@ -3728,5 +3733,88 @@ mod tests {
         assert_eq!(split_assignment("/usr/bin/a=b"), None);
         assert_eq!(split_assignment("2FOO=bar"), None);
         assert_eq!(split_assignment("claude"), None);
+    }
+
+    /// A window shaped like the real one: our workspace inside the `Root`
+    /// that owns the dialog layer. Nothing here writes to disk — the tests
+    /// below only open and close dialogs — so the data dir is left alone.
+    fn test_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<Workspace>, &mut gpui::VisualTestContext) {
+        cx.update(|cx| gpui_component::init(cx));
+        let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let keep = holder.clone();
+        let (_root, cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(Workspace::new);
+            *keep.borrow_mut() = Some(workspace.clone());
+            gpui_component::Root::new(gpui::AnyView::from(workspace), window, cx)
+        });
+        let workspace = holder.borrow().clone().expect("workspace built");
+        (workspace, cx)
+    }
+
+    /// Opening a dialog has to reach the dialog layer, not just our own
+    /// state: the panel is rendered by `Root` now, so a dialog that only
+    /// existed in `self.dialog` would never appear.
+    #[gpui::test]
+    fn opening_a_dialog_puts_it_in_the_dialog_layer(cx: &mut gpui::TestAppContext) {
+        let (workspace, cx) = test_window(cx);
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |this, cx| this.open_settings_dialog(window, cx))
+        });
+        assert!(workspace.read_with(cx, |this, _| this.dialog.is_some()));
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+
+        cx.update(|window, cx| workspace.update(cx, |this, cx| this.close_dialog(window, cx)));
+        assert!(workspace.read_with(cx, |this, _| this.dialog.is_none()));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    }
+
+    /// Opening the dialog layer focuses the dialog itself, so a field
+    /// focused before presenting silently loses the keyboard. The field the
+    /// user is meant to type into has to end up focused.
+    #[gpui::test]
+    fn opening_a_dialog_focuses_its_first_field(cx: &mut gpui::TestAppContext) {
+        let (workspace, cx) = test_window(cx);
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |this, cx| this.open_settings_dialog(window, cx))
+        });
+
+        let wanted = workspace.read_with(cx, |this, cx| match &this.dialog {
+            Some(Dialog::Settings {
+                preset_inputs,
+                focus_handle,
+                ..
+            }) => preset_inputs
+                .first()
+                .map(|first| first.name.focus_handle(cx))
+                .unwrap_or_else(|| focus_handle.clone()),
+            _ => panic!("settings dialog did not open"),
+        });
+        assert!(
+            cx.update(|window, _| wanted.is_focused(window)),
+            "the dialog took the keyboard off its own field"
+        );
+    }
+
+    /// Reopening the search dialog reuses the open one rather than stacking
+    /// a second panel on top of it.
+    #[gpui::test]
+    fn reopening_search_does_not_stack_dialogs(cx: &mut gpui::TestAppContext) {
+        let (workspace, cx) = test_window(cx);
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.open_search_dialog(window, cx);
+                this.open_search_dialog(window, cx);
+            })
+        });
+
+        // Without a terminal on screen there is nothing to search, so the
+        // dialog must not have opened at all.
+        assert!(workspace.read_with(cx, |this, _| this.dialog.is_none()));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
     }
 }

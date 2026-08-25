@@ -12,6 +12,7 @@ use gpui::{
 };
 
 use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
+use gpui_component::WindowExt as _;
 use crate::log;
 use crate::planner;
 use crate::state::{
@@ -571,7 +572,6 @@ impl Workspace {
         }
         log::info(format!("project added: {}", path.display()));
         self.state.projects.push(ProjectRecord::new(path));
-        self.dialog = None;
         self.status = None;
         self.persist(cx);
         cx.notify();
@@ -763,7 +763,7 @@ impl Workspace {
             error: None,
             _subscription: subscription,
         });
-        cx.notify();
+        self.present_dialog(px(560.), window, cx);
     }
 
     // ---- Settings ----
@@ -896,7 +896,7 @@ impl Workspace {
             planner_preset_row,
             _subscriptions: subscriptions,
         });
-        cx.notify();
+        self.present_dialog(px(620.), window, cx);
     }
 
     fn add_preset_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -931,6 +931,7 @@ impl Workspace {
     /// typing goes nowhere until the terminal is clicked.
     fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dialog = None;
+        window.close_dialog(cx);
         if let Some(id) = self.selected.clone() {
             if let Some(view) = self.active_terminal(&id) {
                 let handle = view.focus_handle(cx);
@@ -1111,7 +1112,11 @@ impl Workspace {
                 };
                 match outcome {
                     Ok(workspace) => {
+                        // Dismiss the dialog layer too, not just our state:
+                        // the panel lives in Root now, so dropping the state
+                        // alone would leave it on screen.
                         this.dialog = None;
+                        window.close_dialog(cx);
                         this.finish_spawn(repo, task, workspace, preset, window, cx);
                     }
                     Err(message) => {
@@ -1306,7 +1311,7 @@ impl Workspace {
             status: None,
             _subscription: subscription,
         });
-        cx.notify();
+        self.present_dialog(px(460.), window, cx);
     }
 
     /// Run one search step against the terminal the user is looking at.
@@ -2820,7 +2825,11 @@ impl Workspace {
             .child(chip("Dark", theme::ThemeMode::Dark, cx))
     }
 
-    fn render_dialog(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
+    /// The body of the open dialog. The surface around it — backdrop,
+    /// panel, escape and the focus trap — belongs to gpui-component's
+    /// dialog layer, which re-runs this on every frame, so the content can
+    /// read live state (planning in progress, an error, a chip selection).
+    fn render_dialog_content(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
         let dialog = self.dialog.as_ref()?;
 
         let panel = match dialog {
@@ -2836,13 +2845,6 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .w(px(560.))
-                    .max_w_full()
-                    .p_4()
-                    .rounded_sm()
-                    .bg(theme::panel_bg())
-                    .border_1()
-                    .border_color(theme::border())
                     .child(
                         div()
                             .text_color(theme::fg())
@@ -2990,13 +2992,6 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .w(px(460.))
-                    .max_w_full()
-                    .p_4()
-                    .rounded_sm()
-                    .bg(theme::panel_bg())
-                    .border_1()
-                    .border_color(theme::border())
                     .child(div().text_color(theme::fg()).child("Find in terminal"))
                     .child(Input::new(&input))
                     .child(
@@ -3189,14 +3184,7 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .w(px(640.))
-                    .max_w_full()
                     .max_h_full()
-                    .p_4()
-                    .rounded_sm()
-                    .bg(theme::panel_bg())
-                    .border_1()
-                    .border_color(theme::border())
                     .child(div().text_color(theme::fg()).child("Settings"))
                     .child(
                         div()
@@ -3275,35 +3263,41 @@ impl Workspace {
             }
         };
 
-        Some(
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .p_8()
-                .bg(gpui::hsla(0., 0., 0., 0.5))
-                // A modal has to swallow the mouse: without this the backdrop
-                // has no hitbox, so clicks and drags fall straight through to
-                // the terminal underneath, which then starts a selection or
-                // forwards the drag to the program behind the dialog.
-                .occlude()
-                // Escape belongs to the dialog as a whole, not just to its
-                // text fields: the `escape` key binding is scoped to the
-                // TextInput context, so it stops working the moment focus
-                // moves to a button, a chip or the panel itself. This sits on
-                // an ancestor of everything in the dialog, so it sees the key
-                // whatever inside has focus.
-                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                    if event.keystroke.key == "escape" {
-                        this.close_dialog(window, cx);
-                        cx.stop_propagation();
+        Some(panel)
+    }
+
+    /// Hand the open dialog to the dialog layer. `Root` owns the backdrop,
+    /// the focus trap and escape from here on; closing it there has to clear
+    /// our own `dialog` state, hence the `on_close` hook.
+    fn present_dialog(&mut self, width: gpui::Pixels, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.entity();
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            // `update` rather than `read`: the content wires up listeners,
+            // which need our own context.
+            let content = this.update(cx, |this, cx| this.render_dialog_content(cx));
+            let dialog = dialog
+                .w(width)
+                // Never wider than the window; a long preset name used to
+                // push the buttons off the edge.
+                .max_w(px(920.))
+                .close_button(false)
+                .on_close({
+                    let this = this.clone();
+                    // Escape, the backdrop and the close button all end here,
+                    // so this is where our own dialog state is cleared.
+                    move |_, _window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.dialog = None;
+                            cx.notify();
+                        });
                     }
-                }))
-                .child(panel)
-                .into_any_element(),
-        )
+                });
+            match content {
+                Some(content) => dialog.child(content),
+                None => dialog,
+            }
+        });
+        cx.notify();
     }
 
     fn submit_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3597,10 +3591,6 @@ impl Render for Workspace {
         }
 
         root = root.child(self.render_main_pane(cx));
-
-        if let Some(dialog) = self.render_dialog(cx) {
-            root = root.child(dialog);
-        }
 
         root
     }

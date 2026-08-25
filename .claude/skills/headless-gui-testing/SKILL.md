@@ -130,6 +130,12 @@ Window coordinates: sway tiles a single window to fill the output, so with
 `default_border none` surface coordinates == output coordinates:
 `swaymsg -t get_tree | jq '..|select(.name? and .pid?)|{name,rect}'`
 
+⚠️ **wlpoint's coordinate space is `WLPOINT_EXTENT`, default `1280x820`.**
+At any other output resolution set `WLPOINT_EXTENT=<W>x<H>` to match, or
+every click/drag is silently rescaled and lands in the wrong place — which
+looks exactly like an app bug (dialogs "not opening", drops "ignored").
+This has cost real debugging time twice.
+
 ## Gotchas when driving the app
 
 - `pkill -f <pattern>` can match your own bash compound command and kill the

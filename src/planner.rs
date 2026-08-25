@@ -138,9 +138,10 @@ pub const DEFAULT_MODEL: &str = "haiku";
 pub struct PlannerSettings {
     /// Full command line; when set, `preset_command` and `model` are unused.
     pub command: String,
-    /// Command line derived from the selected agent preset, already carrying
-    /// the print-mode flags and the model. Empty when no preset is selected.
-    pub preset_command: String,
+    /// Argv derived from the selected agent preset, already split, already
+    /// `$VAR`-expanded, and already carrying the print-mode flags and the
+    /// model. Empty when no preset is selected.
+    pub preset_argv: Vec<String>,
     /// Environment from that preset, so planning runs with the same settings
     /// as the work — a sandbox preset plans inside the sandbox.
     pub env: Vec<(String, String)>,
@@ -229,22 +230,27 @@ about an existing pull request, it MUST have the form "#<PR number> <2-4 word su
     // Env first (one-off overrides), then the settings, then the default. A
     // configured command wins over a configured model, which is what the
     // settings dialog says it does.
-    let command = match (cmd_override, model_override) {
-        (Some(command), _) => command,
-        (None, Some(model)) => planner_command_for(&model)?,
+    // The selected agent preset arrives already split and expanded; the other
+    // sources are command *lines* and are split here.
+    let (command, mut parts) = match (cmd_override, model_override) {
+        (Some(command), _) => (command.clone(), split_command(&command)),
+        (None, Some(model)) => {
+            let command = planner_command_for(&model)?;
+            (command.clone(), split_command(&command))
+        }
         (None, None) => match non_empty(&settings.command) {
-            Some(command) => command,
-            // Then the selected agent preset, which already carries its own
-            // flags, wrapper and model, and finally plain `claude -p`.
-            None => match non_empty(&settings.preset_command) {
-                Some(command) => command,
-                None => planner_command_for(
+            Some(command) => (command.clone(), split_command(&command)),
+            None if !settings.preset_argv.is_empty() => {
+                (settings.preset_argv.join(" "), settings.preset_argv.clone())
+            }
+            None => {
+                let command = planner_command_for(
                     &non_empty(&settings.model).unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-                )?,
-            },
+                )?;
+                (command.clone(), split_command(&command))
+            }
         },
     };
-    let mut parts = split_command(&command);
     if parts.is_empty() {
         bail!("empty planner command");
     }
@@ -253,6 +259,9 @@ about an existing pull request, it MUST have the form "#<PR number> <2-4 word su
     let out = Command::new(&program)
         .args(&parts)
         .arg(&prompt)
+        // In the repository, so a sandboxed preset wraps the project rather
+        // than whatever directory harmonium happens to have been started in.
+        .current_dir(repo)
         .envs(settings.env.iter().cloned())
         .env_remove("ANTHROPIC_LOG")
         .output()

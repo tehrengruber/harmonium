@@ -1042,7 +1042,7 @@ impl Workspace {
         cx.notify();
 
         let repo = project_path.clone();
-        let planner_settings = self.planner_settings();
+        let planner_settings = self.planner_settings(&project_path);
         cx.spawn_in(window, async move |this, cx| {
             let repo_for_bg = repo.clone();
             let task_for_bg = task.clone();
@@ -1134,19 +1134,18 @@ impl Workspace {
             .find(|preset| preset.name == name)
     }
 
-    fn planner_settings(&self) -> planner::PlannerSettings {
+    fn planner_settings(&self, repo: &Path) -> planner::PlannerSettings {
         let model = self.state.settings.planner_model.clone();
         let preset = self.planner_preset();
         planner::PlannerSettings {
             command: self.state.settings.planner_command.clone(),
-            preset_command: preset
-                .map(|preset| preset.planner_command(&model))
+            preset_argv: preset
+                .map(|preset| planner_argv(preset, &model, repo))
                 .unwrap_or_default(),
             // The planner is a one-shot run of the same agent, so it gets the
-            // preset's environment too — task variables aren't among them,
-            // since there is no task yet to describe.
+            // preset's environment too, expanded against the same variables.
             env: preset
-                .map(|preset| parse_env(&preset.env, &[]))
+                .map(|preset| parse_env(&preset.env, &planner_task_env(repo)))
                 .unwrap_or_default(),
             model,
         }
@@ -3383,6 +3382,24 @@ fn task_env(project_path: &Path, workdir: &Path, branch: Option<&str>) -> Vec<(S
         env.push(("HARMONIUM_TASK_BRANCH".to_string(), branch.to_string()));
     }
     env
+}
+
+/// The task variables that exist before there is a task: the project is
+/// known, a worktree is not. `WORKDIR` is the repository itself, which is
+/// where the planner runs, so a preset that mounts either still resolves.
+fn planner_task_env(repo: &Path) -> Vec<(String, String)> {
+    task_env(repo, repo, None)
+}
+
+/// A planner preset's command, split and `$VAR`-expanded the same way an agent
+/// spawn would do it. Without this a mounted preset reaches the wrapper with a
+/// literal `$HARMONIUM_TASK_GIT_ROOT`, which it rejects as an invalid path.
+pub fn planner_argv(preset: &PresetRecord, model: &str, repo: &Path) -> Vec<String> {
+    let vars = planner_task_env(repo);
+    planner::split_command(&preset.planner_command(model))
+        .iter()
+        .map(|word| expand_vars(word, &vars))
+        .collect()
 }
 
 /// Expand `$NAME` and `${NAME}` in one command word against `vars`, falling

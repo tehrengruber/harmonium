@@ -32,8 +32,8 @@ fn main() {
             .and_then(|name| settings.presets.iter().find(|p| p.name == name));
         let planner_settings = planner::PlannerSettings {
             command: settings.planner_command,
-            preset_command: preset
-                .map(|p| p.planner_command(&settings.planner_model))
+            preset_argv: preset
+                .map(|p| workspace::planner_argv(p, &settings.planner_model, &repo))
                 .unwrap_or_default(),
             env: Vec::new(),
             model: settings.planner_model,

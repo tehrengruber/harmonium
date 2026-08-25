@@ -942,16 +942,25 @@ impl gpui::Element for TextElement {
                 if start > end || (start == end && !(row_start < selected_range.end && row_end > selected_range.start)) {
                     continue;
                 }
-                let (Some(start_position), Some(end_position)) = (
-                    layout.position_for_index(start),
-                    layout.position_for_index(end),
-                ) else {
-                    continue;
+                // An index on a wrap boundary belongs to two rows and is
+                // reported on the *earlier* one, so asking for its x here
+                // would place this row's highlight where the previous row
+                // ended. Only an index that actually renders on this row can
+                // give an x; otherwise the selection runs through the row and
+                // the relevant edge is the row's own.
+                let row_bottom = row_top + line_height;
+                let x_on_row = |index: usize, edge: Pixels| {
+                    layout
+                        .position_for_index(index)
+                        .filter(|p| p.y >= row_top && p.y < row_bottom)
+                        .map_or(edge, |p| p.x)
                 };
+                let start_x = x_on_row(start, px(0.));
+                let end_x = x_on_row(end, bounds.size.width);
                 selection_quads.push(fill(
                     Bounds::from_corners(
-                        origin + point(start_position.x, row_top),
-                        origin + point(end_position.x, row_top + line_height),
+                        origin + point(start_x, row_top),
+                        origin + point(end_x, row_bottom),
                     ),
                     selection_color,
                 ));

@@ -795,6 +795,23 @@ impl gpui::Element for TextElement {
                 // rem-based line height. Measuring rows taller than they are
                 // painted left a growing band of dead space under the text.
                 let line_height = text_style.line_height_in_pixels(window.rem_size());
+                let min_height = line_height * MIN_MULTILINE_ROWS as f32;
+                // Bounded by the rows *and* by the window, so a short window
+                // doesn't hide the dialog's buttons behind a field that fits
+                // its 12 rows.
+                let max_height = (line_height * MAX_MULTILINE_ROWS as f32)
+                    .min(window.viewport_size().height * 0.5)
+                    .max(min_height);
+                // The intrinsic-size passes (min/max-content) ask how wide
+                // this wants to be with no width to wrap against. The answer
+                // is "no wider than you like": the field wraps, so it has no
+                // intrinsic width. Answering with the unwrapped text width
+                // instead made the field's minimum grow with every word
+                // typed, dragging the dialog wider and making its height jump
+                // as the two layout passes disagreed about the wrap points.
+                let Some(width) = width else {
+                    return size(px(0.), min_height);
+                };
                 let runs = [TextRun {
                     len: display_text.len(),
                     font: text_style.font(),
@@ -803,28 +820,19 @@ impl gpui::Element for TextElement {
                     underline: None,
                     strikethrough: None,
                 }];
-                let layout =
-                    shape_layout(&display_text, &runs, font_size, line_height, width, window);
-                // Grow with the text, but only so far: past this the field
-                // scrolls instead. Unbounded growth pushed the dialog's own
-                // buttons off the bottom of the window, so a long task could
-                // be typed but not submitted.
-                let min_height = line_height * MIN_MULTILINE_ROWS as f32;
-                // Also bounded by the window, so a short window doesn't hide
-                // the dialog's buttons behind a field that fits its 12 rows.
-                let max_height = (line_height * MAX_MULTILINE_ROWS as f32)
-                    .min(window.viewport_size().height * 0.5)
-                    .max(min_height);
-                size(
-                    width.unwrap_or_else(|| {
-                        layout
-                            .lines
-                            .iter()
-                            .map(|l| l.size(line_height).width)
-                            .fold(px(0.), |a, b| a.max(b))
-                    }),
-                    layout.total_height().clamp(min_height, max_height),
-                )
+                // Grows with the text, but only so far: past the maximum the
+                // field scrolls instead. Unbounded growth pushed the dialog's
+                // buttons off the bottom, so a long task could be typed but
+                // not submitted.
+                let layout = shape_layout(
+                    &display_text,
+                    &runs,
+                    font_size,
+                    line_height,
+                    Some(width),
+                    window,
+                );
+                size(width, layout.total_height().clamp(min_height, max_height))
             },
         );
         (layout_id, ())

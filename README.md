@@ -214,7 +214,11 @@ cargo build --release
 ```
 
 Needs the usual GPUI Linux dependencies (Wayland/X11 headers, fontconfig,
-freetype, libxkbcommon, Vulkan loader). GPUI is pinned to Zed tag `v0.217.5`.
+freetype, libxkbcommon, Vulkan loader). GPUI comes from crates.io (`0.2.2`),
+which is the release [gpui-component](https://github.com/longbridge/gpui-component)
+builds against — the widget library the dialogs and text fields are built
+from. Both resolve to one `gpui`; pinning the Zed git tag instead would pull
+in a second, incompatible copy.
 The exact Debian/Ubuntu package list lives in
 `.github/actions/linux-build-deps/action.yml`; the Arch list is in
 `packaging/arch/PKGBUILD` (and in the headless-testing skill).
@@ -279,8 +283,8 @@ src/
   workspace.rs     root view: sidebar, dialogs, agent lifecycle
   state.rs         Project/Agent records + JSON persistence
   planner.rs       LLM task planning + git worktree management
-  input.rs         minimal text input widget (typing, editing keys, paste)
-  theme.rs         colors & fonts
+  theme.rs         colors & fonts (also points gpui-component's theme at
+                   our light/dark mode)
   terminal/
     mod.rs         alacritty_terminal PTY wrapper (GPUI entity), key encoding,
                    ANSI color resolution

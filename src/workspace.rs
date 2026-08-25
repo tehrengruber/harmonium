@@ -2717,6 +2717,10 @@ impl Workspace {
                     theme::fg()
                 })
                 .hover(|s| s.opacity(0.85))
+                // A long preset name must not widen the dialog past the
+                // window: the chip is capped and its label ellipsized.
+                .max_w_full()
+                .truncate()
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(Dialog::Settings {
                         planner_preset_row, ..
@@ -2748,7 +2752,7 @@ impl Workspace {
                 continue;
             }
             let label = if name.is_empty() { command } else { name };
-            row = row.child(chip(label.into(), Some(index), cx));
+            row = row.child(chip(ellipsize(&label, CHIP_LABEL_CHARS).into(), Some(index), cx));
         }
         row.into_any_element()
     }
@@ -2808,6 +2812,7 @@ impl Workspace {
                     .flex_col()
                     .gap_2()
                     .w(px(560.))
+                    .max_w_full()
                     .p_4()
                     .rounded_sm()
                     .bg(theme::panel_bg())
@@ -2849,13 +2854,19 @@ impl Workspace {
                                 theme::fg()
                             })
                             .hover(|s| s.opacity(0.85))
+                            // Long preset names must not widen the dialog.
+                            .max_w_full()
+                            .truncate()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Some(Dialog::NewAgent { preset, .. }) = &mut this.dialog {
                                     *preset = index;
                                 }
                                 cx.notify();
                             }))
-                            .child(SharedString::from(preset_record.name.clone())),
+                            .child(SharedString::from(ellipsize(
+                                &preset_record.name,
+                                CHIP_LABEL_CHARS,
+                            ))),
                     );
                 }
                 panel = panel.child(chips);
@@ -2955,6 +2966,7 @@ impl Workspace {
                     .flex_col()
                     .gap_2()
                     .w(px(460.))
+                    .max_w_full()
                     .p_4()
                     .rounded_sm()
                     .bg(theme::panel_bg())
@@ -3078,7 +3090,7 @@ impl Workspace {
                                 .text_xs()
                                 .child(text),
                         )
-                        .child(div().flex_1().child(input))
+                        .child(div().flex_1().min_w_0().child(input))
                 };
                 let mut preset_list = div().flex().flex_col().gap_2();
                 for (index, inputs) in preset_inputs.iter().enumerate() {
@@ -3105,7 +3117,7 @@ impl Workspace {
                                     .items_center()
                                     .gap_2()
                                     .child(label("Name"))
-                                    .child(div().flex_1().child(inputs.name.clone()))
+                                    .child(div().flex_1().min_w_0().child(inputs.name.clone()))
                                     .child(
                                         div()
                                             .id(("preset-remove", index))
@@ -3129,7 +3141,7 @@ impl Workspace {
                                     .items_center()
                                     .gap_2()
                                     .child(label("Command"))
-                                    .child(div().flex_1().child(inputs.command.clone())),
+                                    .child(div().flex_1().min_w_0().child(inputs.command.clone())),
                             )
                             .child(
                                 div()
@@ -3137,7 +3149,7 @@ impl Workspace {
                                     .items_center()
                                     .gap_2()
                                     .child(label("Env"))
-                                    .child(div().flex_1().child(inputs.env.clone())),
+                                    .child(div().flex_1().min_w_0().child(inputs.env.clone())),
                             ),
                     );
                 }
@@ -3153,6 +3165,7 @@ impl Workspace {
                     .flex_col()
                     .gap_2()
                     .w(px(640.))
+                    .max_w_full()
                     .max_h_full()
                     .p_4()
                     .rounded_sm()
@@ -3165,6 +3178,8 @@ impl Workspace {
                             .id("settings-body")
                             .flex_1()
                             .min_h_0()
+                            .min_w_0()
+                            .overflow_x_hidden()
                             .overflow_y_scroll()
                             .flex()
                             .flex_col()
@@ -3319,6 +3334,21 @@ fn parse_env(text: &str, vars: &[(String, String)]) -> Vec<(String, String)> {
         }
     }
     parsed
+}
+
+/// How much of a preset name a chip shows before eliding the rest.
+const CHIP_LABEL_CHARS: usize = 40;
+
+/// Shorten a label for a chip. Chips are pickers, not displays: a preset with
+/// a 200-character name would otherwise widen the row past the dialog, and
+/// layout-level truncation needs a resolved width that a wrapping chip row
+/// doesn't give it.
+fn ellipsize(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{}…", kept.trim_end())
 }
 
 fn is_var_name(name: &str) -> bool {
@@ -3643,6 +3673,17 @@ mod tests {
         // Non-assignments are dropped rather than silently becoming something.
         assert_eq!(parse_env("claude --continue", &vars), Vec::new());
         assert_eq!(parse_env("", &vars), Vec::new());
+    }
+
+    #[test]
+    fn chip_labels_are_shortened_not_wide() {
+        assert_eq!(ellipsize("short", 10), "short");
+        assert_eq!(ellipsize("exactly-10", 10), "exactly-10");
+        assert_eq!(ellipsize("a-very-long-preset-name", 10), "a-very-lo…");
+        // Multi-byte input must not be split mid-character.
+        assert_eq!(ellipsize("äöüßäöüßäöüß", 5), "äöüß…");
+        // A trailing space before the ellipsis reads as a typo.
+        assert_eq!(ellipsize("word morewords", 6), "word…");
     }
 
     #[test]

@@ -338,6 +338,7 @@ impl Workspace {
 
     fn set_theme(&mut self, mode: theme::ThemeMode, cx: &mut Context<Self>) {
         theme::set_mode(mode);
+        theme::sync_component_theme(cx);
         self.state.settings.theme = mode;
         self.persist(cx);
         let views: Vec<_> = self.terminals.values().cloned().collect();
@@ -2397,7 +2398,7 @@ impl Workspace {
                         }));
                     tab = tab.child(
                         div()
-                            .id(format!("close-{tab_id_for_close}"))
+                            .id(SharedString::from(format!("close-{tab_id_for_close}")))
                             .ml_1()
                             .text_color(theme::fg_dim())
                             .hover(|s| s.text_color(theme::error()))

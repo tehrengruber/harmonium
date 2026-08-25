@@ -8,8 +8,8 @@ mod theme;
 mod workspace;
 
 use gpui::{
-    actions, px, size, App, AppContext as _, Application, Bounds, KeyBinding, QuitMode,
-    TitlebarOptions, WindowBounds, WindowOptions,
+    actions, px, size, App, AppContext as _, Application, Bounds, KeyBinding, TitlebarOptions,
+    WindowBounds, WindowOptions,
 };
 
 actions!(harmonium, [Quit, NewTerminalTab, SearchTerminal]);
@@ -48,15 +48,19 @@ fn main() {
         return;
     }
 
-    // Closing the last window must not quit us from inside gpui's window
-    // teardown: on X11 that runs while the platform client's RefCell is
-    // borrowed for the event being handled, and `App::quit` re-enters it
-    // ("RefCell already borrowed"). Quitting is ours to do, one tick later.
-    let app = Application::new()
-        .with_assets(assets::Assets)
-        .with_quit_mode(QuitMode::Explicit);
+    // gpui never quits on its own when the last window closes, so that is
+    // ours to do. It must not happen inside gpui's window teardown: on X11
+    // that runs while the platform client's RefCell is borrowed for the
+    // event being handled, and `App::quit` re-enters it ("RefCell already
+    // borrowed"). Hence the deferred quit one tick later, below.
+    let app = Application::new().with_assets(assets::Assets);
 
     app.run(|cx: &mut App| {
+        // Component library: must be initialised before any of its widgets
+        // are built, and it owns the window's root element (see `Root`).
+        gpui_component::init(cx);
+        theme::sync_component_theme(cx);
+
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.spawn(async move |cx| {
@@ -136,7 +140,10 @@ fn main() {
                         true
                     }
                 });
-                workspace
+                // gpui-component renders dialogs, notifications and popups
+                // into layers owned by `Root`, so it has to be the window's
+                // root element with our workspace inside it.
+                cx.new(|cx| gpui_component::Root::new(gpui::AnyView::from(workspace), window, cx))
             },
         )
         .expect("failed to open window");

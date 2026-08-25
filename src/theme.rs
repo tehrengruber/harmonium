@@ -71,6 +71,17 @@ pub fn set_mode(mode: ThemeMode) {
     DARK.store(mode == ThemeMode::Dark, Ordering::Relaxed);
 }
 
+/// Point gpui-component's semantic theme at the same light/dark mode as our
+/// own palette, so library widgets and hand-painted chrome agree. Call after
+/// [`set_mode`] and once at startup.
+pub fn sync_component_theme(cx: &mut App) {
+    let mode = match mode() {
+        ThemeMode::Dark => gpui_component::ThemeMode::Dark,
+        ThemeMode::Light => gpui_component::ThemeMode::Light,
+    };
+    gpui_component::Theme::change(mode, None, cx);
+}
+
 pub fn mode() -> ThemeMode {
     if dark() {
         ThemeMode::Dark

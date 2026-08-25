@@ -1,5 +1,4 @@
 mod assets;
-mod input;
 mod log;
 mod planner;
 mod state;
@@ -77,11 +76,11 @@ fn main() {
         // New shell tab for the selected agent, handled by the workspace.
         // Key bindings are matched before any `on_key_down` listener, so this
         // wins over the focused terminal's keyboard passthrough; excluding
-        // TextInput keeps it inert while a dialog field has the keyboard.
+        // the Input context keeps it inert while a dialog field has the keyboard.
         cx.bind_keys([KeyBinding::new(
             "ctrl-shift-t",
             NewTerminalTab,
-            Some("!TextInput"),
+            Some("!Input"),
         )]);
 
         // Search the visible terminal's scrollback. Bound everywhere *except*
@@ -90,32 +89,8 @@ fn main() {
         cx.bind_keys([KeyBinding::new(
             "ctrl-shift-f",
             SearchTerminal,
-            Some("!TextInput"),
+            Some("!Input"),
         )]);
-
-        // Text input editing keys, scoped to focused TextInput widgets.
-        cx.bind_keys([
-            KeyBinding::new("backspace", input::Backspace, Some("TextInput")),
-            KeyBinding::new("delete", input::Delete, Some("TextInput")),
-            KeyBinding::new("left", input::Left, Some("TextInput")),
-            KeyBinding::new("right", input::Right, Some("TextInput")),
-            KeyBinding::new("shift-left", input::SelectLeft, Some("TextInput")),
-            KeyBinding::new("shift-right", input::SelectRight, Some("TextInput")),
-            KeyBinding::new("ctrl-a", input::SelectAll, Some("TextInput")),
-            KeyBinding::new("ctrl-v", input::Paste, Some("TextInput")),
-            KeyBinding::new("ctrl-c", input::Copy, Some("TextInput")),
-            KeyBinding::new("ctrl-x", input::Cut, Some("TextInput")),
-            KeyBinding::new("home", input::Home, Some("TextInput")),
-            KeyBinding::new("end", input::End, Some("TextInput")),
-            KeyBinding::new("escape", input::Cancel, Some("TextInput")),
-            // Single-line: enter submits. Multiline: enter inserts a newline,
-            // ctrl-enter submits, up/down move the cursor.
-            KeyBinding::new("enter", input::Submit, Some("TextInput && !multiline")),
-            KeyBinding::new("enter", input::Newline, Some("TextInput && multiline")),
-            KeyBinding::new("ctrl-enter", input::Submit, Some("TextInput && multiline")),
-            KeyBinding::new("up", input::Up, Some("TextInput && multiline")),
-            KeyBinding::new("down", input::Down, Some("TextInput && multiline")),
-        ]);
 
         let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
         cx.open_window(

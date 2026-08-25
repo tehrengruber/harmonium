@@ -11,7 +11,7 @@ use gpui::{
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
 };
 
-use crate::input::{InputEvent, TextInput};
+use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use crate::log;
 use crate::planner;
 use crate::state::{
@@ -24,15 +24,15 @@ use crate::terminal::{Terminal, TerminalEvent};
 use crate::theme;
 
 struct PresetInputs {
-    name: Entity<TextInput>,
-    command: Entity<TextInput>,
-    env: Entity<TextInput>,
+    name: Entity<InputState>,
+    command: Entity<InputState>,
+    env: Entity<InputState>,
 }
 
 enum Dialog {
     NewAgent {
         project_path: PathBuf,
-        input: Entity<TextInput>,
+        input: Entity<InputState>,
         planning: bool,
         preset: usize,
         workspace_mode: WorkspaceMode,
@@ -43,7 +43,7 @@ enum Dialog {
     /// selecting them, so the dialog stays out of the way of the terminal
     /// itself and the usual copy shortcut works on whatever it found.
     Search {
-        input: Entity<TextInput>,
+        input: Entity<InputState>,
         match_case: bool,
         wrap: bool,
         /// Result of the last search — "no matches", "wrapped", …
@@ -54,10 +54,10 @@ enum Dialog {
         /// Focus target for the panel itself, so the modal always owns the
         /// keyboard even when it has no input to focus (no presets yet).
         focus_handle: FocusHandle,
-        planner_command: Entity<TextInput>,
-        planner_model: Entity<TextInput>,
-        terminal_font: Entity<TextInput>,
-        ui_font: Entity<TextInput>,
+        planner_command: Entity<InputState>,
+        planner_model: Entity<InputState>,
+        terminal_font: Entity<InputState>,
+        ui_font: Entity<InputState>,
         preset_inputs: Vec<PresetInputs>,
         /// Which preset row the planner should run through, as an index into
         /// `preset_inputs` so a rename in the same visit still points at the
@@ -66,6 +66,10 @@ enum Dialog {
         _subscriptions: Vec<Subscription>,
     },
 }
+
+/// Rows the task field grows to before it scrolls instead. Without a cap a
+/// long description pushes the Spawn button off the bottom of the window.
+const MAX_TASK_ROWS: usize = 12;
 
 const MIN_SIDEBAR_WIDTH: f32 = 180.;
 const MAX_SIDEBAR_WIDTH: f32 = 600.;
@@ -132,7 +136,7 @@ struct Spawn {
 /// Inline editing of an agent's name in the sidebar.
 struct InlineEdit {
     id: AgentId,
-    input: Entity<TextInput>,
+    input: Entity<InputState>,
     _subscription: Subscription,
 }
 
@@ -720,20 +724,25 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let input = cx.new(|cx| {
-            TextInput::multiline("Describe the task… (ctrl-enter to spawn)", cx)
+            InputState::new(window, cx)
+                .placeholder("Describe the task… (ctrl-enter to spawn)")
+                .multi_line(true)
+                .auto_grow(1, MAX_TASK_ROWS)
         });
         let path = project_path.clone();
         let subscription = cx.subscribe_in(
             &input,
             window,
-            move |this, _input, event: &InputEvent, window, cx| match event {
-                InputEvent::Submitted(task) => {
-                    let task = task.trim().to_string();
+            move |this, input, event: &InputEvent, window, cx| {
+                // Multi-line: plain enter inserts a newline, the secondary
+                // chord (ctrl-enter here) spawns. Escape is handled by the
+                // dialog overlay, which owns it for every dialog.
+                if let InputEvent::PressEnter { secondary: true } = event {
+                    let task = input.read(cx).value().trim().to_string();
                     if !task.is_empty() {
                         this.spawn_agent(path.clone(), task, window, cx);
                     }
                 }
-                InputEvent::Cancelled => this.close_dialog(window, cx),
             },
         );
         window.focus(&input.focus_handle(cx));
@@ -768,20 +777,22 @@ impl Workspace {
         subscriptions: &mut Vec<Subscription>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Entity<TextInput> {
+    ) -> Entity<InputState> {
+        let value = value.to_string();
         let input = cx.new(|cx| {
-            let mut input = TextInput::new(placeholder, cx);
+            let mut state = InputState::new(window, cx).placeholder(placeholder);
             if !value.is_empty() {
-                input.set_text(value.to_string(), cx);
+                state.set_value(value, window, cx);
             }
-            input
+            state
         });
         subscriptions.push(cx.subscribe_in(
             &input,
             window,
-            |this, _input, event: &InputEvent, window, cx| match event {
-                InputEvent::Submitted(_) => this.save_settings(window, cx),
-                InputEvent::Cancelled => this.close_dialog(window, cx),
+            |this, _input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.save_settings(window, cx);
+                }
             },
         ));
         input
@@ -795,21 +806,23 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> PresetInputs {
         let mut make = |placeholder: &'static str, value: &str| {
+            let value = value.to_string();
             let input = cx.new(|cx| {
-                let mut input = TextInput::new(placeholder, cx);
+                let mut state = InputState::new(window, cx).placeholder(placeholder);
                 if !value.is_empty() {
-                    input.set_text(value.to_string(), cx);
+                    state.set_value(value, window, cx);
                 }
-                input
+                state
             });
             // `subscribe_in` rather than `subscribe`: closing the dialog has
             // to hand the keyboard back to the terminal, which needs a window.
             subscriptions.push(cx.subscribe_in(
                 &input,
                 window,
-                |this, _input, event: &InputEvent, window, cx| match event {
-                    InputEvent::Submitted(_) => this.save_settings(window, cx),
-                    InputEvent::Cancelled => this.close_dialog(window, cx),
+                |this, _input, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.save_settings(window, cx);
+                    }
                 },
             ));
             input
@@ -941,7 +954,7 @@ impl Workspace {
             return;
         };
         let planner_preset_row = *planner_preset_row;
-        let text = |input: &Entity<TextInput>| input.read(cx).text().trim().to_string();
+        let text = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
         let planner_command = text(planner_command);
         let planner_model = text(planner_model);
         let terminal_font = text(terminal_font);
@@ -951,9 +964,9 @@ impl Workspace {
         // the saved name has to be looked up while the mapping is still known.
         let mut planner_preset = None;
         for (row, inputs) in preset_inputs.iter().enumerate() {
-            let name = inputs.name.read(cx).text().trim().to_string();
-            let command = inputs.command.read(cx).text().trim().to_string();
-            let env = inputs.env.read(cx).text().trim().to_string();
+            let name = inputs.name.read(cx).value().trim().to_string();
+            let command = inputs.command.read(cx).value().trim().to_string();
+            let env = inputs.env.read(cx).value().trim().to_string();
             if name.is_empty() && command.is_empty() {
                 continue;
             }
@@ -1268,19 +1281,21 @@ impl Workspace {
         if let Some(Dialog::Search { input, status, .. }) = &mut self.dialog {
             *status = None;
             let input = input.clone();
-            input.update(cx, |input, cx| input.select_all_text(cx));
+            // Select the old query so the next keystroke replaces it.
             window.focus(&input.focus_handle(cx));
+            window.dispatch_action(Box::new(SelectAll), cx);
             cx.notify();
             return;
         }
-        let input = cx.new(|cx| TextInput::new("Find in terminal…", cx));
+        let input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Find in terminal…"));
         let subscription = cx.subscribe_in(
             &input,
             window,
-            move |this, _input, event: &InputEvent, window, cx| match event {
+            move |this, _input, event: &InputEvent, _window, cx| match event {
                 // Enter walks forward through the matches.
-                InputEvent::Submitted(_) => this.find_in_terminal(true, cx),
-                InputEvent::Cancelled => this.close_dialog(window, cx),
+                InputEvent::PressEnter { .. } => this.find_in_terminal(true, cx),
+                _ => {}
             },
         );
         window.focus(&input.focus_handle(cx));
@@ -1305,7 +1320,7 @@ impl Workspace {
         else {
             return;
         };
-        let query = input.read(cx).text().to_string();
+        let query = input.read(cx).value().to_string();
         let options = crate::terminal::SearchOptions {
             forward,
             match_case: *match_case,
@@ -1730,27 +1745,25 @@ impl Workspace {
         };
         let name = record.name.clone();
         let input = cx.new(|cx| {
-            let mut input = TextInput::new("Agent name", cx);
-            input.set_text(name, cx);
-            input
+            let mut state = InputState::new(window, cx).placeholder("Agent name");
+            state.set_value(name, window, cx);
+            state
         });
         let id_for_sub = id.clone();
         let subscription = cx.subscribe(
             &input,
-            move |this, _input, event: &InputEvent, cx| match event {
-                InputEvent::Submitted(text) => {
+            move |this, input, event: &InputEvent, cx| {
+                // Escape is handled on the row itself: unlike the dialogs,
+                // an inline edit has no overlay to own the key.
+                if let InputEvent::PressEnter { .. } = event {
+                    let text = input.read(cx).value().trim().to_string();
                     if let Some(record) = this.state.agent_mut(&id_for_sub) {
-                        let text = text.trim().to_string();
                         if !text.is_empty() {
                             record.name = text;
                         }
                     }
                     this.inline_edit = None;
                     this.persist(cx);
-                    cx.notify();
-                }
-                InputEvent::Cancelled => {
-                    this.inline_edit = None;
                     cx.notify();
                 }
             },
@@ -1973,7 +1986,19 @@ impl Workspace {
                             div()
                                 .ml_4()
                                 .my_0p5()
-                                .child(edit.input.clone()),
+                                // Escape abandons the rename. A dialog gets
+                                // this from its overlay; an inline edit has
+                                // no overlay, so the row owns the key.
+                                .on_key_down(cx.listener(
+                                    |this, event: &gpui::KeyDownEvent, _window, cx| {
+                                        if event.keystroke.key == "escape" {
+                                            this.inline_edit = None;
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        }
+                                    },
+                                ))
+                                .child(Input::new(&edit.input)),
                         );
                         continue;
                     }
@@ -2746,8 +2771,8 @@ impl Workspace {
             )
             .child(chip("Default (claude)".into(), None, cx));
         for (index, inputs) in preset_inputs.iter().enumerate() {
-            let name = inputs.name.read(cx).text().trim().to_string();
-            let command = inputs.command.read(cx).text().trim().to_string();
+            let name = inputs.name.read(cx).value().trim().to_string();
+            let command = inputs.command.read(cx).value().trim().to_string();
             if name.is_empty() && command.is_empty() {
                 continue;
             }
@@ -2823,7 +2848,7 @@ impl Workspace {
                             .text_color(theme::fg())
                             .child("New agent — describe the task"),
                     )
-                    .child(input.clone());
+                    .child(Input::new(&input));
 
                 // Preset selector.
                 let selected = *preset;
@@ -2973,7 +2998,7 @@ impl Workspace {
                     .border_1()
                     .border_color(theme::border())
                     .child(div().text_color(theme::fg()).child("Find in terminal"))
-                    .child(input.clone())
+                    .child(Input::new(&input))
                     .child(
                         div()
                             .flex()
@@ -3077,7 +3102,7 @@ impl Workspace {
                         .mt_2()
                         .child(text)
                 };
-                let field = |text: &'static str, input: Entity<TextInput>| {
+                let field = |text: &'static str, input: Entity<InputState>| {
                     div()
                         .flex()
                         .items_center()
@@ -3090,7 +3115,7 @@ impl Workspace {
                                 .text_xs()
                                 .child(text),
                         )
-                        .child(div().flex_1().min_w_0().child(input))
+                        .child(div().flex_1().min_w_0().child(Input::new(&input)))
                 };
                 let mut preset_list = div().flex().flex_col().gap_2();
                 for (index, inputs) in preset_inputs.iter().enumerate() {
@@ -3117,7 +3142,7 @@ impl Workspace {
                                     .items_center()
                                     .gap_2()
                                     .child(label("Name"))
-                                    .child(div().flex_1().min_w_0().child(inputs.name.clone()))
+                                    .child(div().flex_1().min_w_0().child(Input::new(&inputs.name)))
                                     .child(
                                         div()
                                             .id(("preset-remove", index))
@@ -3141,7 +3166,7 @@ impl Workspace {
                                     .items_center()
                                     .gap_2()
                                     .child(label("Command"))
-                                    .child(div().flex_1().min_w_0().child(inputs.command.clone())),
+                                    .child(div().flex_1().min_w_0().child(Input::new(&inputs.command))),
                             )
                             .child(
                                 div()
@@ -3149,7 +3174,7 @@ impl Workspace {
                                     .items_center()
                                     .gap_2()
                                     .child(label("Env"))
-                                    .child(div().flex_1().min_w_0().child(inputs.env.clone())),
+                                    .child(div().flex_1().min_w_0().child(Input::new(&inputs.env))),
                             ),
                     );
                 }
@@ -3204,7 +3229,7 @@ impl Workspace {
                             .child(field("Command", planner_command.clone()))
                             .child(field("Model", planner_model.clone()))
                             .when(
-                                !planner_command.read(cx).text().trim().is_empty(),
+                                !planner_command.read(cx).value().trim().is_empty(),
                                 |panel| {
                                     panel.child(
                                         div()
@@ -3290,7 +3315,7 @@ impl Workspace {
                 ..
             }) => {
                 if !*planning {
-                    let task = input.read(cx).text().trim().to_string();
+                    let task = input.read(cx).value().trim().to_string();
                     if !task.is_empty() {
                         self.spawn_agent(project_path.clone(), task, window, cx);
                     }

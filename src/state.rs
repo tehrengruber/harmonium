@@ -558,7 +558,10 @@ impl StateFile {
         Self::load_from(state_file())
     }
 
-    fn load_from(path: PathBuf) -> Result<(Self, AppState), LoadError> {
+    /// [`load`](Self::load) against an explicit path. Tests address their
+    /// state files this way so each gets one of its own — the lock is per
+    /// file, and tests in a module run at the same time.
+    pub(crate) fn load_from(path: PathBuf) -> Result<(Self, AppState), LoadError> {
         let lock = claim(&path)?;
         // Under the lock, so the only writer that can slip between the read and
         // the stamp is one that isn't harmonium.

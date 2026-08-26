@@ -12,6 +12,7 @@ use gpui::{
 };
 
 use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
+use gpui_component::WindowExt as _;
 use crate::log;
 use crate::planner;
 use crate::state::{
@@ -596,7 +597,6 @@ impl Workspace {
         }
         log::info(format!("project added: {}", path.display()));
         self.state.projects.push(ProjectRecord::new(path));
-        self.dialog = None;
         self.status = None;
         self.persist(cx);
         cx.notify();
@@ -770,7 +770,7 @@ impl Workspace {
                 }
             },
         );
-        window.focus(&input.focus_handle(cx));
+        let focus = input.focus_handle(cx);
         let preset = self
             .state
             .settings
@@ -788,7 +788,10 @@ impl Workspace {
             error: None,
             _subscription: subscription,
         });
-        cx.notify();
+        // After presenting, never before: opening the dialog layer focuses
+        // the dialog itself, which would take the keyboard off the field.
+        self.present_dialog(px(560.), window, cx);
+        window.focus(&focus);
     }
 
     // ---- Settings ----
@@ -900,10 +903,10 @@ impl Workspace {
             cx,
         );
         let focus_handle = cx.focus_handle();
-        match preset_inputs.first() {
-            Some(first) => window.focus(&first.name.focus_handle(cx)),
-            None => window.focus(&focus_handle),
-        }
+        let focus = match preset_inputs.first() {
+            Some(first) => first.name.focus_handle(cx),
+            None => focus_handle.clone(),
+        };
         let planner_preset_row = self.state.settings.planner_preset.as_deref().and_then(|name| {
             self.state
                 .settings
@@ -921,7 +924,8 @@ impl Workspace {
             planner_preset_row,
             _subscriptions: subscriptions,
         });
-        cx.notify();
+        self.present_dialog(px(620.), window, cx);
+        window.focus(&focus);
     }
 
     fn add_preset_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -956,6 +960,7 @@ impl Workspace {
     /// typing goes nowhere until the terminal is clicked.
     fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dialog = None;
+        window.close_dialog(cx);
         if let Some(id) = self.selected.clone() {
             if let Some(view) = self.active_terminal(&id) {
                 let handle = view.focus_handle(cx);
@@ -1136,7 +1141,11 @@ impl Workspace {
                 };
                 match outcome {
                     Ok(workspace) => {
+                        // Dismiss the dialog layer too, not just our state:
+                        // the panel lives in Root now, so dropping the state
+                        // alone would leave it on screen.
                         this.dialog = None;
+                        window.close_dialog(cx);
                         this.finish_spawn(repo, task, workspace, preset, window, cx);
                     }
                     Err(message) => {
@@ -1323,7 +1332,7 @@ impl Workspace {
                 _ => {}
             },
         );
-        window.focus(&input.focus_handle(cx));
+        let focus = input.focus_handle(cx);
         self.dialog = Some(Dialog::Search {
             input,
             match_case: false,
@@ -1331,7 +1340,8 @@ impl Workspace {
             status: None,
             _subscription: subscription,
         });
-        cx.notify();
+        self.present_dialog(px(460.), window, cx);
+        window.focus(&focus);
     }
 
     /// Run one search step against the terminal the user is looking at.
@@ -2845,7 +2855,11 @@ impl Workspace {
             .child(chip("Dark", theme::ThemeMode::Dark, cx))
     }
 
-    fn render_dialog(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
+    /// The body of the open dialog. The surface around it — backdrop,
+    /// panel, escape and the focus trap — belongs to gpui-component's
+    /// dialog layer, which re-runs this on every frame, so the content can
+    /// read live state (planning in progress, an error, a chip selection).
+    fn render_dialog_content(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
         let dialog = self.dialog.as_ref()?;
 
         let panel = match dialog {
@@ -2861,13 +2875,6 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .w(px(560.))
-                    .max_w_full()
-                    .p_4()
-                    .rounded_sm()
-                    .bg(theme::panel_bg())
-                    .border_1()
-                    .border_color(theme::border())
                     .child(
                         div()
                             .text_color(theme::fg())
@@ -3015,13 +3022,6 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .w(px(460.))
-                    .max_w_full()
-                    .p_4()
-                    .rounded_sm()
-                    .bg(theme::panel_bg())
-                    .border_1()
-                    .border_color(theme::border())
                     .child(div().text_color(theme::fg()).child("Find in terminal"))
                     .child(Input::new(&input))
                     .child(
@@ -3214,14 +3214,7 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .w(px(640.))
-                    .max_w_full()
                     .max_h_full()
-                    .p_4()
-                    .rounded_sm()
-                    .bg(theme::panel_bg())
-                    .border_1()
-                    .border_color(theme::border())
                     .child(div().text_color(theme::fg()).child("Settings"))
                     .child(
                         div()
@@ -3300,35 +3293,41 @@ impl Workspace {
             }
         };
 
-        Some(
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .p_8()
-                .bg(gpui::hsla(0., 0., 0., 0.5))
-                // A modal has to swallow the mouse: without this the backdrop
-                // has no hitbox, so clicks and drags fall straight through to
-                // the terminal underneath, which then starts a selection or
-                // forwards the drag to the program behind the dialog.
-                .occlude()
-                // Escape belongs to the dialog as a whole, not just to its
-                // text fields: the `escape` key binding is scoped to the
-                // TextInput context, so it stops working the moment focus
-                // moves to a button, a chip or the panel itself. This sits on
-                // an ancestor of everything in the dialog, so it sees the key
-                // whatever inside has focus.
-                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                    if event.keystroke.key == "escape" {
-                        this.close_dialog(window, cx);
-                        cx.stop_propagation();
+        Some(panel)
+    }
+
+    /// Hand the open dialog to the dialog layer. `Root` owns the backdrop,
+    /// the focus trap and escape from here on; closing it there has to clear
+    /// our own `dialog` state, hence the `on_close` hook.
+    fn present_dialog(&mut self, width: gpui::Pixels, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.entity();
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            // `update` rather than `read`: the content wires up listeners,
+            // which need our own context.
+            let content = this.update(cx, |this, cx| this.render_dialog_content(cx));
+            let dialog = dialog
+                .w(width)
+                // Never wider than the window; a long preset name used to
+                // push the buttons off the edge.
+                .max_w(px(920.))
+                .close_button(false)
+                .on_close({
+                    let this = this.clone();
+                    // Escape, the backdrop and the close button all end here,
+                    // so this is where our own dialog state is cleared.
+                    move |_, _window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.dialog = None;
+                            cx.notify();
+                        });
                     }
-                }))
-                .child(panel)
-                .into_any_element(),
-        )
+                });
+            match content {
+                Some(content) => dialog.child(content),
+                None => dialog,
+            }
+        });
+        cx.notify();
     }
 
     fn submit_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3623,10 +3622,6 @@ impl Render for Workspace {
 
         root = root.child(self.render_main_pane(cx));
 
-        if let Some(dialog) = self.render_dialog(cx) {
-            root = root.child(dialog);
-        }
-
         root
     }
 }
@@ -3763,5 +3758,101 @@ mod tests {
         assert_eq!(split_assignment("/usr/bin/a=b"), None);
         assert_eq!(split_assignment("2FOO=bar"), None);
         assert_eq!(split_assignment("claude"), None);
+    }
+
+    /// A window shaped like the real one: our workspace inside the `Root`
+    /// that owns the dialog layer. The tests below only open and close
+    /// dialogs, so nothing is saved — but a workspace owns a session file
+    /// either way, and this gives each test one of its own under the
+    /// temporary directory `data_dir()` resolves to in a test process. Two
+    /// tests sharing one would be two harmoniums, and the second would find
+    /// the first holding the lock.
+    fn test_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<Workspace>, &mut gpui::VisualTestContext) {
+        cx.update(|cx| gpui_component::init(cx));
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let session = state::data_dir()
+            .join(format!(
+                "window-{}",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))
+            .join("state.json");
+        let (state_file, state) =
+            StateFile::load_from(session).expect("a state file of this test's own");
+        let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let keep = holder.clone();
+        let (_root, cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(state, state_file, cx));
+            *keep.borrow_mut() = Some(workspace.clone());
+            gpui_component::Root::new(gpui::AnyView::from(workspace), window, cx)
+        });
+        let workspace = holder.borrow().clone().expect("workspace built");
+        (workspace, cx)
+    }
+
+    /// Opening a dialog has to reach the dialog layer, not just our own
+    /// state: the panel is rendered by `Root` now, so a dialog that only
+    /// existed in `self.dialog` would never appear.
+    #[gpui::test]
+    fn opening_a_dialog_puts_it_in_the_dialog_layer(cx: &mut gpui::TestAppContext) {
+        let (workspace, cx) = test_window(cx);
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |this, cx| this.open_settings_dialog(window, cx))
+        });
+        assert!(workspace.read_with(cx, |this, _| this.dialog.is_some()));
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+
+        cx.update(|window, cx| workspace.update(cx, |this, cx| this.close_dialog(window, cx)));
+        assert!(workspace.read_with(cx, |this, _| this.dialog.is_none()));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    }
+
+    /// Opening the dialog layer focuses the dialog itself, so a field
+    /// focused before presenting silently loses the keyboard. The field the
+    /// user is meant to type into has to end up focused.
+    #[gpui::test]
+    fn opening_a_dialog_focuses_its_first_field(cx: &mut gpui::TestAppContext) {
+        let (workspace, cx) = test_window(cx);
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |this, cx| this.open_settings_dialog(window, cx))
+        });
+
+        let wanted = workspace.read_with(cx, |this, cx| match &this.dialog {
+            Some(Dialog::Settings {
+                preset_inputs,
+                focus_handle,
+                ..
+            }) => preset_inputs
+                .first()
+                .map(|first| first.name.focus_handle(cx))
+                .unwrap_or_else(|| focus_handle.clone()),
+            _ => panic!("settings dialog did not open"),
+        });
+        assert!(
+            cx.update(|window, _| wanted.is_focused(window)),
+            "the dialog took the keyboard off its own field"
+        );
+    }
+
+    /// Reopening the search dialog reuses the open one rather than stacking
+    /// a second panel on top of it.
+    #[gpui::test]
+    fn reopening_search_does_not_stack_dialogs(cx: &mut gpui::TestAppContext) {
+        let (workspace, cx) = test_window(cx);
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.open_search_dialog(window, cx);
+                this.open_search_dialog(window, cx);
+            })
+        });
+
+        // Without a terminal on screen there is nothing to search, so the
+        // dialog must not have opened at all.
+        assert!(workspace.read_with(cx, |this, _| this.dialog.is_none()));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
     }
 }

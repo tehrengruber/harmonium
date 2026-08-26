@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, svg, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render, ScrollHandle,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
+    div, px, svg, App, AppContext as _, Bounds, ClickEvent, Context, Div, ElementId, Entity,
+    FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
+    Point, Render, ScrollHandle, SharedString, Stateful, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, Window,
 };
 
 use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
@@ -16,8 +17,8 @@ use gpui_component::WindowExt as _;
 use crate::log;
 use crate::planner;
 use crate::state::{
-    AgentId, AgentRecord, AppState, PresetRecord, ProjectRecord, SaveError, StateFile,
-    TerminalTabRecord, WorkspaceMode,
+    AgentGroup, AgentId, AgentRecord, AppState, PendingAgentMove, PresetRecord, ProjectRecord,
+    SaveError, StateFile, TerminalTabRecord, WorkspaceMode,
 };
 use crate::state;
 use crate::terminal::view::TerminalView;
@@ -33,6 +34,9 @@ struct PresetInputs {
 enum Dialog {
     NewAgent {
         project_path: PathBuf,
+        /// Group the new agent lands in, when the spawn was started from a
+        /// group header rather than the project row.
+        group: Option<String>,
         input: Entity<InputState>,
         planning: bool,
         preset: usize,
@@ -117,13 +121,26 @@ enum DragTarget {
     Agent {
         project_index: usize,
         from: AgentId,
-        to: AgentId,
+        /// Row the dragged agent takes the place of. `None` when the pointer
+        /// is on a group header: there may be no row there to aim at.
+        to: Option<AgentId>,
+        /// Group the row lands in — the target row's, or the header's.
+        group: Option<String>,
     },
     Tab {
         agent: AgentId,
         from: String,
         to: String,
     },
+}
+
+/// One row under an expanded project, in the order they are drawn.
+enum SidebarItem {
+    /// Index into the project's `agents`.
+    Agent(usize),
+    /// Index into the project's `groups`.
+    Header(usize),
+    NewGroup,
 }
 
 /// A resolved command line for a terminal: the program to exec, its
@@ -134,11 +151,29 @@ struct Spawn {
     env: Vec<(String, String)>,
 }
 
-/// Inline editing of an agent's name in the sidebar.
+/// What an inline edit in the sidebar is renaming.
+#[derive(Clone, PartialEq)]
+enum EditTarget {
+    Agent(AgentId),
+    /// A group header. Groups have no id of their own, so this is positional;
+    /// the edit is transient enough that nothing gets to reorder underneath
+    /// it, and the paths that could — removing a project or a group — end it.
+    Group { project: usize, group: usize },
+}
+
+/// Inline editing of an agent's or a group's name in the sidebar.
 struct InlineEdit {
-    id: AgentId,
+    target: EditTarget,
     input: Entity<InputState>,
     _subscription: Subscription,
+}
+
+/// A sidebar row that reveals its actions under the pointer.
+#[derive(PartialEq, Eq, Clone, Debug)]
+enum HoveredRow {
+    Project(usize),
+    Agent(AgentId),
+    Group { project: usize, group: usize },
 }
 
 pub struct Workspace {
@@ -174,6 +209,12 @@ pub struct Workspace {
     status: Option<(String, bool)>,
     /// Pending drag, previewed in the list until the drop lands.
     drag_target: Option<DragTarget>,
+    /// The sidebar row the pointer is over, if any. Kept in view state
+    /// rather than left to gpui's `group_hover`, because these rows *reflow*
+    /// on hover — the name or the rule gives up the width the actions take —
+    /// and group styles are applied during paint, after layout has already
+    /// run, so a width set there is silently ignored.
+    hovered_row: Option<HoveredRow>,
     /// Scroll position of the log panel, so new output can pin to the bottom.
     log_scroll: ScrollHandle,
     /// Log version last rendered, and the task polling for more output while
@@ -209,6 +250,7 @@ impl Workspace {
             resizing_sidebar: false,
             status: None,
             drag_target: None,
+            hovered_row: None,
             log_scroll: ScrollHandle::new(),
             log_version: log::version(),
             log_task: None,
@@ -606,6 +648,9 @@ impl Workspace {
         if index >= self.state.projects.len() {
             return;
         }
+        // An inline edit is positional for groups: the indices behind this
+        // project have just shifted out from under it.
+        self.inline_edit = None;
         let project = self.state.projects.remove(index);
         for agent in &project.agents {
             let tab_ids: Vec<String> =
@@ -687,10 +732,107 @@ impl Workspace {
                 project_index,
                 from,
                 to,
-            } => self.move_agent(project_index, &from, &to, cx),
+                group,
+            } => self.move_agent(project_index, &from, to.as_ref(), group, cx),
             DragTarget::Tab { agent, from, to } => self.move_tab(&agent, &from, &to, cx),
         }
         true
+    }
+
+    /// The chrome every row in the sidebar shares — projects, agents, group
+    /// headers and the two "new …" rows alike: one line high, its own hover
+    /// highlight, and a click target spanning the panel. What tells the kinds
+    /// apart is behaviour, not shape, so the caller adds the drag, drop and
+    /// click handling and any indentation of its own.
+    fn sidebar_row(id: impl Into<ElementId>) -> Stateful<Div> {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::hover_bg()))
+    }
+
+    /// An action at the right end of a sidebar row. Rendered only while its
+    /// row is hovered — see [`Workspace::hovered_row`] — so a row at rest is
+    /// just its name, with the full width to show it in.
+    ///
+    /// The tints reach a text glyph through the inherited text style. An
+    /// `svg` icon is not text: gpui paints one from its *own* computed
+    /// `text.color` and inherits nothing, so an svg passed here has to carry
+    /// its colour, and the hover tint reaches only the background behind it.
+    fn row_action(
+        id: impl Into<ElementId>,
+        tint: Hsla,
+        hover_tint: Hsla,
+        icon: impl IntoElement,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .flex_none()
+            .px_1()
+            .rounded_sm()
+            // The same size as the label beside it, so a glyph action sits
+            // on the row's text metrics instead of the panel's default.
+            .text_sm()
+            .text_color(tint)
+            .hover(move |s| s.bg(theme::selected_bg()).text_color(hover_tint))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                // Without this the row underneath also selects, folds, or
+                // opens its own editor.
+                cx.stop_propagation();
+                action(this, window, cx);
+            }))
+            .child(icon)
+    }
+
+    /// An icon for a sidebar action. Sized in rems like the text beside it,
+    /// so both grow together with the font-size setting and keep sharing the
+    /// row's baseline — an icon needs no nudging to sit level, and a nudge is
+    /// only ever right at the one size it was measured at.
+    fn row_icon(path: &'static str) -> gpui::Svg {
+        svg()
+            .path(path)
+            .size_3()
+            .text_color(theme::fg_dim())
+    }
+
+    /// The name a sidebar row carries: one line, taking whatever width the
+    /// actions leave it and clipping rather than wrapping.
+    fn row_label(text: impl Into<SharedString>, color: Hsla) -> Div {
+        div()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .child(
+                div()
+                    .text_color(color)
+                    .text_sm()
+                    .whitespace_nowrap()
+                    .child(text.into()),
+            )
+    }
+
+    /// Record (or clear) the row under the pointer. A row's leave arrives
+    /// after the next row's enter, so a leave only clears the state when it
+    /// still names the row that set it.
+    fn set_hovered_row(&mut self, row: HoveredRow, hovered: bool, cx: &mut Context<Self>) {
+        let next = if hovered {
+            Some(row)
+        } else if self.hovered_row.as_ref() == Some(&row) {
+            None
+        } else {
+            return;
+        };
+        if self.hovered_row != next {
+            self.hovered_row = next;
+            cx.notify();
+        }
     }
 
     fn set_drag_target(&mut self, target: DragTarget, cx: &mut Context<Self>) {
@@ -707,23 +849,74 @@ impl Workspace {
         cx.notify();
     }
 
-    fn move_agent(&mut self, project: usize, from: &AgentId, to: &AgentId, cx: &mut Context<Self>) {
+    /// Drop an agent onto `to` — or, when `to` is `None`, at the top of
+    /// `group`, which is what dropping on a header means. The row adopts the
+    /// group it lands in, so one gesture both reorders and regroups.
+    fn move_agent(
+        &mut self,
+        project_index: usize,
+        from: &AgentId,
+        to: Option<&AgentId>,
+        group: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.drag_target = None;
-        let Some(agents) = self
-            .state
-            .projects
-            .get_mut(project)
-            .map(|project| &mut project.agents)
-        else {
+        let Some(project) = self.state.projects.get_mut(project_index) else {
             return;
         };
-        let index = |id: &AgentId| agents.iter().position(|agent| &agent.id == id);
-        let (Some(from), Some(to)) = (index(from), index(to)) else {
+        let index = |agents: &[AgentRecord], id: &AgentId| {
+            agents.iter().position(|agent| &agent.id == id)
+        };
+        let Some(from) = index(&project.agents, from) else {
             return;
         };
-        Self::reorder(agents, from, to);
+        // Before any move: setting the group doesn't shift indices.
+        project.agents[from].group = group.clone();
+        match to {
+            Some(to) => {
+                let Some(to) = index(&project.agents, to) else {
+                    return;
+                };
+                Self::reorder(&mut project.agents, from, to);
+            }
+            None => {
+                let record = project.agents.remove(from);
+                let head = project
+                    .agents
+                    .iter()
+                    .position(|agent| agent.group == group)
+                    .unwrap_or(project.agents.len());
+                project.agents.insert(head, record);
+                // Landing in a folded group would put the row somewhere the
+                // user can't see it.
+                if let Some(index) = group.as_deref().and_then(|g| project.group_index(g)) {
+                    project.groups[index].expanded = true;
+                }
+            }
+        }
+        // A drop at a run's edge is ambiguous about which side it lands on;
+        // this settles it without disturbing the order inside the run.
+        project.normalize_agent_order();
         self.persist(cx);
         cx.notify();
+    }
+
+    /// The drag currently hovering `project_index`'s agent rows, in the shape
+    /// [`ProjectRecord::previewed_agents`] wants.
+    fn pending_agent_move(&self, project_index: usize) -> Option<PendingAgentMove<'_>> {
+        match &self.drag_target {
+            Some(DragTarget::Agent {
+                project_index: project,
+                from,
+                to,
+                group,
+            }) if *project == project_index => Some(PendingAgentMove {
+                from,
+                to: to.as_ref(),
+                group: group.as_deref(),
+            }),
+            _ => None,
+        }
     }
 
     fn move_tab(&mut self, agent: &AgentId, from: &str, to: &str, cx: &mut Context<Self>) {
@@ -745,6 +938,7 @@ impl Workspace {
     fn open_new_agent_dialog(
         &mut self,
         project_path: PathBuf,
+        group: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -778,6 +972,7 @@ impl Workspace {
             .min(self.state.settings.presets.len().saturating_sub(1));
         self.dialog = Some(Dialog::NewAgent {
             project_path,
+            group,
             input,
             planning: false,
             preset,
@@ -1050,10 +1245,12 @@ impl Workspace {
     ) {
         let preset_index;
         let workspace_mode;
+        let group;
         if let Some(Dialog::NewAgent {
             planning,
             preset,
             workspace_mode: mode,
+            group: into_group,
             error,
             ..
         }) = &mut self.dialog
@@ -1065,9 +1262,11 @@ impl Workspace {
             *error = None;
             preset_index = *preset;
             workspace_mode = *mode;
+            group = into_group.clone();
         } else {
             preset_index = self.state.settings.last_preset;
             workspace_mode = WorkspaceMode::Auto;
+            group = None;
         }
         let preset = self
             .state
@@ -1146,7 +1345,7 @@ impl Workspace {
                         // alone would leave it on screen.
                         this.dialog = None;
                         window.close_dialog(cx);
-                        this.finish_spawn(repo, task, workspace, preset, window, cx);
+                        this.finish_spawn(repo, group, task, workspace, preset, window, cx);
                     }
                     Err(message) => {
                         // Keep the dialog open so the task text isn't lost;
@@ -1214,6 +1413,7 @@ impl Workspace {
     fn finish_spawn(
         &mut self,
         project_path: PathBuf,
+        group: Option<String>,
         task: String,
         workspace: planner::Workspace,
         preset: PresetRecord,
@@ -1232,6 +1432,7 @@ impl Workspace {
             resume_command: Some(preset.resume_command()),
             env: Some(preset.env.clone()),
             terminals: Vec::new(),
+            group: None,
         };
         let Some(project) = self
             .state
@@ -1250,6 +1451,14 @@ impl Workspace {
         ));
         project.agents.push(record);
         project.expanded = true;
+        // Spawned from a group header: land in that group, unless it was
+        // renamed or deleted while the planner was running.
+        if let Some(group) = group.filter(|name| project.group_index(name).is_some()) {
+            if let Some(agent) = project.agents.last_mut() {
+                agent.group = Some(group);
+            }
+            project.normalize_agent_order();
+        }
         self.persist(cx);
 
         let task_env = self.agent_task_env(&id);
@@ -1746,9 +1955,34 @@ impl Workspace {
         self.terminals.get(&tab_id)
     }
 
+    /// Unfold whatever is hiding an agent's row — its project, its group — so
+    /// the agent on screen always has a row in the panel to match.
+    fn reveal_agent(&mut self, id: &AgentId) -> bool {
+        for project in &mut self.state.projects {
+            let Some(agent) = project.agents.iter().find(|agent| &agent.id == id) else {
+                continue;
+            };
+            let group = agent
+                .group
+                .clone()
+                .and_then(|name| project.group_index(&name));
+            let mut changed = !project.expanded;
+            project.expanded = true;
+            if let Some(group) = group.map(|index| &mut project.groups[index]) {
+                changed |= !group.expanded;
+                group.expanded = true;
+            }
+            return changed;
+        }
+        false
+    }
+
     fn select_agent(&mut self, id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = Some(id.clone());
         self.inline_edit = None;
+        if self.reveal_agent(&id) {
+            self.persist(cx);
+        }
         // Saved agents get their processes spawned the first time they are
         // looked at, not all at once during startup.
         self.restore_agent(&id, cx);
@@ -1779,36 +2013,155 @@ impl Workspace {
             return;
         };
         let name = record.name.clone();
+        self.begin_inline_edit(EditTarget::Agent(id), "Agent name", name, window, cx);
+    }
+
+    /// Rename a group in place. Also how a group gets its *first* name: a new
+    /// one is created unnamed and opens straight into this.
+    fn start_group_edit(
+        &mut self,
+        project: usize,
+        group: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self
+            .state
+            .projects
+            .get(project)
+            .and_then(|p| p.groups.get(group))
+        else {
+            return;
+        };
+        let name = record.name.clone();
+        self.begin_inline_edit(
+            EditTarget::Group { project, group },
+            "Group name",
+            name,
+            window,
+            cx,
+        );
+    }
+
+    fn begin_inline_edit(
+        &mut self,
+        target: EditTarget,
+        placeholder: &'static str,
+        value: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let input = cx.new(|cx| {
-            let mut state = InputState::new(window, cx).placeholder("Agent name");
-            state.set_value(name, window, cx);
+            let mut state = InputState::new(window, cx).placeholder(placeholder);
+            state.set_value(value, window, cx);
             state
         });
-        let id_for_sub = id.clone();
-        let subscription = cx.subscribe(
-            &input,
-            move |this, input, event: &InputEvent, cx| {
-                // Escape is handled on the row itself: unlike the dialogs,
-                // an inline edit has no overlay to own the key.
-                if let InputEvent::PressEnter { .. } = event {
-                    let text = input.read(cx).value().trim().to_string();
-                    if let Some(record) = this.state.agent_mut(&id_for_sub) {
-                        if !text.is_empty() {
-                            record.name = text;
-                        }
-                    }
-                    this.inline_edit = None;
-                    this.persist(cx);
-                    cx.notify();
-                }
-            },
-        );
+        let committed = target.clone();
+        let subscription = cx.subscribe(&input, move |this, input, event: &InputEvent, cx| {
+            // Escape is handled on the row itself: unlike the dialogs, an
+            // inline edit has no overlay to own the key.
+            if let InputEvent::PressEnter { .. } = event {
+                let text = input.read(cx).value().trim().to_string();
+                this.commit_inline_edit(&committed, &text, cx);
+            }
+        });
         window.focus(&input.focus_handle(cx));
         self.inline_edit = Some(InlineEdit {
-            id,
+            target,
             input,
             _subscription: subscription,
         });
+        cx.notify();
+    }
+
+    fn commit_inline_edit(&mut self, target: &EditTarget, text: &str, cx: &mut Context<Self>) {
+        match target {
+            EditTarget::Agent(id) => {
+                if let Some(record) = self.state.agent_mut(id) {
+                    if !text.is_empty() {
+                        record.name = text.to_string();
+                    }
+                }
+            }
+            EditTarget::Group { project, group } => {
+                let Some(project) = self.state.projects.get_mut(*project) else {
+                    return;
+                };
+                match project.groups.get(*group) {
+                    // Nothing is ever named nothing: a group created and left
+                    // blank disappears again, and clearing an existing name
+                    // keeps the one it had rather than losing its rows.
+                    Some(existing) if text.is_empty() => {
+                        if existing.name.is_empty() {
+                            project.remove_group(*group);
+                        }
+                    }
+                    Some(_) => project.rename_group(*group, text),
+                    None => return,
+                }
+            }
+        }
+        self.inline_edit = None;
+        self.persist(cx);
+        cx.notify();
+    }
+
+    /// Escape. A group that never got a name goes with it — it only existed
+    /// because the rename was open.
+    fn cancel_inline_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some(InlineEdit {
+            target: EditTarget::Group { project, group },
+            ..
+        }) = &self.inline_edit
+        {
+            let (project, group) = (*project, *group);
+            if let Some(record) = self.state.projects.get_mut(project) {
+                if record.groups.get(group).is_some_and(|g| g.name.is_empty()) {
+                    record.remove_group(group);
+                }
+            }
+        }
+        self.inline_edit = None;
+        cx.notify();
+    }
+
+    // ---- Groups ----
+
+    /// Add a group to a project and open its name for editing straight away.
+    /// Unnamed groups are never persisted: the rename either names it or
+    /// takes it away again.
+    fn add_group(&mut self, project_index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.state.projects.get_mut(project_index) else {
+            return;
+        };
+        project.groups.push(AgentGroup::new(String::new()));
+        let group = project.groups.len() - 1;
+        self.start_group_edit(project_index, group, window, cx);
+    }
+
+    fn toggle_group(&mut self, project_index: usize, group: usize, cx: &mut Context<Self>) {
+        let Some(record) = self
+            .state
+            .projects
+            .get_mut(project_index)
+            .and_then(|p| p.groups.get_mut(group))
+        else {
+            return;
+        };
+        record.expanded = !record.expanded;
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn remove_group(&mut self, project_index: usize, group: usize, cx: &mut Context<Self>) {
+        let Some(project) = self.state.projects.get_mut(project_index) else {
+            return;
+        };
+        project.remove_group(group);
+        // Indices behind it have shifted; an edit still pointing at one would
+        // rename the wrong group.
+        self.inline_edit = None;
+        self.persist(cx);
         cx.notify();
     }
 
@@ -1871,17 +2224,18 @@ impl Workspace {
             let expanded = project.expanded;
             let project_path = project.path.clone();
 
+            let hovered_row = HoveredRow::Project(project_index);
+            let is_hovered = self.hovered_row.as_ref() == Some(&hovered_row);
+
             list = list.child(
-                div()
-                    .id(("project", project_index))
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
+                Self::sidebar_row(("project", project_index))
                     .py_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme::hover_bg()))
+                    .on_hover(cx.listener({
+                        let row = hovered_row.clone();
+                        move |this, hovered: &bool, _window, cx| {
+                            this.set_hovered_row(row.clone(), *hovered, cx)
+                        }
+                    }))
                     .on_drag(ProjectDrag { index: project_index }, |_, _, _, cx| {
                         cx.new(|_| DragGhost)
                     })
@@ -1943,48 +2297,31 @@ impl Workspace {
                             .w_4()
                             .child(if expanded { "▾" } else { "▸" }),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .text_color(theme::fg())
-                                    .text_sm()
-                                    .whitespace_nowrap()
-                                    .child(SharedString::from(project.name.clone())),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id(("new-agent", project_index))
-                            .px_1()
-                            .rounded_sm()
-                            .text_color(theme::accent())
-                            .hover(|s| s.bg(theme::selected_bg()))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.open_new_agent_dialog(project_path.clone(), window, cx);
-                            }))
-                            .child("+"),
-                    )
-                    .child(
-                        div()
-                            .id(("remove-project", project_index))
-                            .px_1()
-                            .rounded_sm()
-                            .text_color(theme::fg_dim())
-                            .hover(|s| s.bg(theme::selected_bg()).text_color(theme::error()))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.remove_project(project_index, cx);
-                            }))
-                            .child("×"),
-                    ),
+                    .child(Self::row_label(project.name.clone(), theme::fg()))
+                    .when(is_hovered, |row| {
+                        row.child(Self::row_action(
+                            ("new-agent", project_index),
+                            theme::accent(),
+                            theme::accent(),
+                            "+",
+                            move |this, window, cx| {
+                                this.open_new_agent_dialog(project_path.clone(), None, window, cx);
+                            },
+                            cx,
+                        ))
+                        .child(Self::row_action(
+                            ("remove-project", project_index),
+                            theme::fg_dim(),
+                            theme::error(),
+                            "×",
+                            move |this, _window, cx| this.remove_project(project_index, cx),
+                            cx,
+                        ))
+                    }),
             );
 
             if expanded {
-                if project.agents.is_empty() {
+                if project.agents.is_empty() && project.groups.is_empty() {
                     list = list.child(
                         div()
                             .pl_8()
@@ -1994,29 +2331,49 @@ impl Workspace {
                             .child("no agents"),
                     );
                 }
-                let agent_order = {
-                    let (from, to) = match &self.drag_target {
-                        Some(DragTarget::Agent {
-                            project_index: dragged_project,
-                            from,
-                            to,
-                        }) if *dragged_project == project_index => (
-                            project.agents.iter().position(|agent| &agent.id == from),
-                            project.agents.iter().position(|agent| &agent.id == to),
-                        ),
-                        _ => (None, None),
+                let rows = project.previewed_agents(self.pending_agent_move(project_index));
+                // The ungrouped run comes first and carries no header:
+                // ungrouped is the default state, and naming it would make
+                // every project pay for a label it never asked for.
+                let mut items: Vec<SidebarItem> = rows
+                    .iter()
+                    .filter(|(_, group)| group.is_none())
+                    .map(|(index, _)| SidebarItem::Agent(*index))
+                    .collect();
+                for (group, record) in project.groups.iter().enumerate() {
+                    let members: Vec<usize> = rows
+                        .iter()
+                        .filter(|(_, name)| name.as_deref() == Some(record.name.as_str()))
+                        .map(|(index, _)| *index)
+                        .collect();
+                    items.push(SidebarItem::Header(group));
+                    // A folded group keeps its header: it is still a drop
+                    // target, and the only way back to what it holds.
+                    if record.expanded {
+                        items.extend(members.into_iter().map(SidebarItem::Agent));
+                    }
+                }
+                items.push(SidebarItem::NewGroup);
+
+                for item in items {
+                    let agent_index = match item {
+                        SidebarItem::Agent(index) => index,
+                        SidebarItem::Header(group) => {
+                            list = list
+                                .child(self.render_group_header(project_index, group, cx));
+                            continue;
+                        }
+                        SidebarItem::NewGroup => {
+                            list = list.child(self.render_new_group_row(project_index, cx));
+                            continue;
+                        }
                     };
-                    Self::preview_order(project.agents.len(), from, to)
-                };
-                for agent_index in agent_order {
                     let agent = &project.agents[agent_index];
                     // Inline description editing initiated from the sidebar
                     // replaces the whole row with the input.
-                    if let Some(edit) = self
-                        .inline_edit
-                        .as_ref()
-                        .filter(|edit| edit.id == agent.id)
-                    {
+                    if let Some(edit) = self.inline_edit.as_ref().filter(|edit| {
+                        edit.target == EditTarget::Agent(agent.id.clone())
+                    }) {
                         list = list.child(
                             div()
                                 .ml_4()
@@ -2027,9 +2384,8 @@ impl Workspace {
                                 .on_key_down(cx.listener(
                                     |this, event: &gpui::KeyDownEvent, _window, cx| {
                                         if event.keystroke.key == "escape" {
-                                            this.inline_edit = None;
+                                            this.cancel_inline_edit(cx);
                                             cx.stop_propagation();
-                                            cx.notify();
                                         }
                                     },
                                 ))
@@ -2053,20 +2409,15 @@ impl Workspace {
                     };
                     let remove_id = agent.id.clone();
                     let edit_id = agent.id.clone();
+                    let hovered_row = HoveredRow::Agent(agent.id.clone());
+                    let is_hovered = self.hovered_row.as_ref() == Some(&hovered_row);
 
                     list = list.child(
-                        div()
-                            .id(("agent", project_index * 1000 + agent_index))
-                            .flex()
-                            .items_center()
+                        Self::sidebar_row(("agent", project_index * 1000 + agent_index))
                             .gap_2()
                             .ml_4()
-                            .px_2()
                             .py_1()
-                            .rounded_sm()
-                            .cursor_pointer()
                             .when(is_selected, |s| s.bg(theme::selected_bg()))
-                            .hover(|s| s.bg(theme::hover_bg()))
                             .on_drag(
                                 AgentDrag {
                                     project: project_index,
@@ -2088,48 +2439,48 @@ impl Workspace {
                                     if from == target {
                                         return;
                                     }
-                                    let Some(agents) = this
-                                        .state
-                                        .projects
-                                        .get(project_index)
-                                        .map(|project| &project.agents)
+                                    let Some(project) =
+                                        this.state.projects.get(project_index)
                                     else {
                                         return;
                                     };
-                                    let index = |id: &AgentId| {
-                                        agents.iter().position(|agent| &agent.id == id)
+                                    // Positions in the *previewed* list, not
+                                    // the stored one: the preview is what the
+                                    // pointer is travelling over, and with
+                                    // groups a pending move can have changed
+                                    // which run the row is in.
+                                    let rows = project.previewed_agents(
+                                        this.pending_agent_move(project_index),
+                                    );
+                                    let shown = |id: &AgentId| {
+                                        rows.iter().position(|(index, _)| {
+                                            &project.agents[*index].id == id
+                                        })
                                     };
                                     let (Some(hovered), Some(dragged)) =
-                                        (index(&target), index(&from))
+                                        (shown(&target), shown(&from))
                                     else {
                                         return;
                                     };
-                                    let pending = match &this.drag_target {
-                                        Some(DragTarget::Agent { from, to, .. }) => {
-                                            index(from).zip(index(to))
-                                        }
-                                        _ => None,
-                                    };
-                                    let shown_before = Self::shown_before(
-                                        agents.len(),
-                                        pending,
-                                        hovered,
-                                        dragged,
-                                    );
                                     let middle =
                                         event.bounds.origin.y + event.bounds.size.height / 2.;
                                     if !Self::past_middle(
-                                        shown_before,
+                                        hovered < dragged,
                                         middle,
                                         event.event.position.y,
                                     ) {
                                         return;
                                     }
+                                    // The row adopts the group of whatever it
+                                    // is displacing, so one gesture reorders
+                                    // and regroups.
+                                    let group = rows[hovered].1.clone();
                                     this.set_drag_target(
                                         DragTarget::Agent {
                                             project_index,
                                             from,
-                                            to: target.clone(),
+                                            to: Some(target.clone()),
+                                            group,
                                         },
                                         cx,
                                     );
@@ -2141,9 +2492,27 @@ impl Workspace {
                                     if this.apply_drag_target(cx) {
                                         return;
                                     }
-                                    if drag.project == project_index {
-                                        this.move_agent(project_index, &drag.id, &target, cx);
+                                    if drag.project != project_index {
+                                        return;
                                     }
+                                    let group = this
+                                        .state
+                                        .projects
+                                        .get(project_index)
+                                        .and_then(|project| {
+                                            let agent = project
+                                                .agents
+                                                .iter()
+                                                .find(|agent| agent.id == target)?;
+                                            project.group_of(agent).map(str::to_string)
+                                        });
+                                    this.move_agent(
+                                        project_index,
+                                        &drag.id,
+                                        Some(&target),
+                                        group,
+                                        cx,
+                                    );
                                 }
                             }))
                             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
@@ -2153,59 +2522,39 @@ impl Workspace {
                                     this.select_agent(id.clone(), window, cx);
                                 }
                             }))
+                            .on_hover(cx.listener({
+                                let row = hovered_row.clone();
+                                move |this, hovered: &bool, _window, cx| {
+                                    this.set_hovered_row(row.clone(), *hovered, cx)
+                                }
+                            }))
                             .child(div().text_color(dot_color).text_xs().child("●"))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    // Name only: the branch used to be shown
-                                    // on a second line, which doubled the row
-                                    // height for information the agent name
-                                    // already implies.
-                                    .child(
-                                        div()
-                                            .text_color(theme::fg())
-                                            .text_sm()
-                                            .whitespace_nowrap()
-                                            .child(SharedString::from(agent.name.clone())),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id(("edit-agent", project_index * 1000 + agent_index))
-                                    .px_1()
-                                    .rounded_sm()
-                                    .text_color(theme::fg_dim())
-                                    .hover(|s| {
-                                        s.bg(theme::selected_bg()).text_color(theme::accent())
-                                    })
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        cx.stop_propagation();
-                                        this.start_inline_edit(edit_id.clone(), window, cx);
-                                    }))
-                                    .child(
-                                        svg()
-                                            .path("icons/pencil.svg")
-                                            .size_3()
-                                            .text_color(theme::fg_dim()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id(("remove-agent", project_index * 1000 + agent_index))
-                                    .px_1()
-                                    .rounded_sm()
-                                    .text_color(theme::fg_dim())
-                                    .hover(|s| {
-                                        s.bg(theme::selected_bg()).text_color(theme::error())
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.remove_agent(remove_id.clone(), cx);
-                                    }))
-                                    .child("×"),
-                            ),
+                            // Name only: the branch used to be shown on a
+                            // second line, which doubled the row height for
+                            // information the agent name already implies.
+                            .child(Self::row_label(agent.name.clone(), theme::fg()))
+                            .when(is_hovered, |row| {
+                                row.child(Self::row_action(
+                                    ("edit-agent", project_index * 1000 + agent_index),
+                                    theme::fg_dim(),
+                                    theme::accent(),
+                                    Self::row_icon("icons/pencil.svg"),
+                                    move |this, window, cx| {
+                                        this.start_inline_edit(edit_id.clone(), window, cx)
+                                    },
+                                    cx,
+                                ))
+                                .child(Self::row_action(
+                                    ("remove-agent", project_index * 1000 + agent_index),
+                                    theme::fg_dim(),
+                                    theme::error(),
+                                    "×",
+                                    move |this, _window, cx| {
+                                        this.remove_agent(remove_id.clone(), cx)
+                                    },
+                                    cx,
+                                ))
+                            }),
                     );
                 }
             }
@@ -2215,16 +2564,8 @@ impl Workspace {
         // the row lines up with the project headers, with a `+` where their
         // expand/collapse triangle goes.
         list = list.child(
-            div()
-                .id("new-project")
-                .flex()
-                .items_center()
-                .gap_1()
-                .px_2()
+            Self::sidebar_row("new-project")
                 .py_1()
-                .rounded_sm()
-                .cursor_pointer()
-                .hover(|s| s.bg(theme::hover_bg()))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.add_project_via_picker(cx);
                 }))
@@ -2235,15 +2576,7 @@ impl Workspace {
                         .w_4()
                         .child("+"),
                 )
-                .child(
-                    div().flex_1().overflow_hidden().child(
-                        div()
-                            .text_color(theme::fg_dim())
-                            .text_sm()
-                            .whitespace_nowrap()
-                            .child("New project"),
-                    ),
-                ),
+                .child(Self::row_label("New project", theme::fg_dim())),
         );
 
         div()
@@ -2329,6 +2662,214 @@ impl Workspace {
                             .child("⚙"),
                             ),
                     ),
+            )
+            .into_any_element()
+    }
+
+    /// A group header: fold triangle, label, a rule running out to the end
+    /// of the row, and actions that appear on hover. The rule is the one from
+    /// the sketch, earning its keep as an underline that carries on past the
+    /// word rather than adding a second full-width division to a panel that
+    /// already has one per project.
+    fn render_group_header(
+        &self,
+        project_index: usize,
+        group_index: usize,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let target = EditTarget::Group {
+            project: project_index,
+            group: group_index,
+        };
+        let key = project_index * 1000 + group_index;
+
+        // Renaming replaces the header, the way it replaces an agent row.
+        if let Some(edit) = self
+            .inline_edit
+            .as_ref()
+            .filter(|edit| edit.target == target)
+        {
+            return div()
+                .ml_4()
+                .my_0p5()
+                .on_key_down(cx.listener(
+                    |this, event: &gpui::KeyDownEvent, _window, cx| {
+                        if event.keystroke.key == "escape" {
+                            this.cancel_inline_edit(cx);
+                            cx.stop_propagation();
+                        }
+                    },
+                ))
+                .child(Input::new(&edit.input))
+                .into_any_element();
+        }
+
+        let Some(project) = self.state.projects.get(project_index) else {
+            return div().into_any_element();
+        };
+        let Some(group) = project.groups.get(group_index) else {
+            return div().into_any_element();
+        };
+        let expanded = group.expanded;
+        let name = group.name.clone();
+        let project_path = project.path.clone();
+        // At rest the header is just label and rule; the actions appear
+        // under the pointer, and the rule gives up the width.
+        let row = HoveredRow::Group {
+            project: project_index,
+            group: group_index,
+        };
+        let hovered = self.hovered_row.as_ref() == Some(&row);
+
+        Self::sidebar_row(("group", key))
+            .ml_4()
+            .py_0p5()
+            .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                this.set_hovered_row(row.clone(), *hovered, cx)
+            }))
+            // A header is an unambiguous target — there is no "which half"
+            // to resolve — so it claims the drag as soon as it is hovered.
+            .on_drag_move(cx.listener({
+                let name = name.clone();
+                move |this, event: &gpui::DragMoveEvent<AgentDrag>, _, cx| {
+                    if !Self::spans_row(event.bounds, event.event.position) {
+                        return;
+                    }
+                    let drag = event.drag(cx);
+                    if drag.project != project_index {
+                        return;
+                    }
+                    this.set_drag_target(
+                        DragTarget::Agent {
+                            project_index,
+                            from: drag.id.clone(),
+                            to: None,
+                            group: Some(name.clone()),
+                        },
+                        cx,
+                    );
+                }
+            }))
+            .on_drop(cx.listener({
+                let name = name.clone();
+                move |this, drag: &AgentDrag, _, cx| {
+                    if this.apply_drag_target(cx) {
+                        return;
+                    }
+                    if drag.project == project_index {
+                        this.move_agent(project_index, &drag.id, None, Some(name.clone()), cx);
+                    }
+                }
+            }))
+            .on_click(cx.listener(
+                move |this, event: &gpui::ClickEvent, window, cx| {
+                    if event.click_count() >= 2 {
+                        this.start_group_edit(project_index, group_index, window, cx);
+                    } else {
+                        this.toggle_group(project_index, group_index, cx);
+                    }
+                },
+            ))
+            .child(
+                div()
+                    .w_4()
+                    .flex_none()
+                    .text_color(theme::fg_dim())
+                    .text_xs()
+                    .child(if expanded { "▾" } else { "▸" }),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_color(theme::fg_dim())
+                    .text_size(theme::label_font_size(cx))
+                    .whitespace_nowrap()
+                    // Uppercase so it reads as a label rather than as another
+                    // row. gpui has no letter-spacing, which is what a label
+                    // this small would otherwise want.
+                    .child(SharedString::from(name.to_uppercase())),
+            )
+            // On the label's baseline, not through its middle, so it reads
+            // as an underline running off the end of the word. The row centres
+            // its children, and centring includes the margin box — so a top
+            // margin of 2n drops the line by n. (`items_baseline` lands near
+            // the x-height instead, and inset is ignored for a flex child.)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .mt(px(f32::from(theme::label_font_size(cx)) * 0.6))
+                    .h(px(1.))
+                    .bg(theme::rule()),
+            )
+            // Only under the pointer, and taking width only then, so at rest
+            // the rule runs the full width of the header instead of stopping
+            // short at space held for something invisible.
+            .when(hovered, |row| {
+                row.child(
+                    Self::row_action(
+                        ("new-group-agent", key),
+                        theme::accent(),
+                        theme::accent(),
+                        "+",
+                        {
+                            let name = name.clone();
+                            move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                                this.open_new_agent_dialog(
+                                    project_path.clone(),
+                                    Some(name.clone()),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        },
+                        cx,
+                    )
+                    // A header's actions sit on the smaller type its label
+                    // uses, so they don't outweigh the group they name.
+                    .text_xs(),
+                )
+                .child(
+                    Self::row_action(
+                        ("remove-group", key),
+                        theme::fg_dim(),
+                        theme::error(),
+                        "×",
+                        move |this, _window, cx| this.remove_group(project_index, group_index, cx),
+                        cx,
+                    )
+                    .text_xs(),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Creating a group is a row in the list rather than another button on
+    /// the project header — the same call "New project" makes at the bottom
+    /// of the panel. It lines up with the headers it creates, with a `+`
+    /// where their fold triangle goes.
+    fn render_new_group_row(&self, project_index: usize, cx: &Context<Self>) -> gpui::AnyElement {
+        Self::sidebar_row(("new-group", project_index))
+            .ml_4()
+            .py_0p5()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.add_group(project_index, window, cx);
+            }))
+            .child(
+                div()
+                    .w_4()
+                    .flex_none()
+                    .text_color(theme::accent())
+                    .text_xs()
+                    .child("+"),
+            )
+            .child(
+                div()
+                    .text_color(theme::fg_dim())
+                    .text_size(theme::label_font_size(cx))
+                    .whitespace_nowrap()
+                    .child("NEW GROUP"),
             )
             .into_any_element()
     }
@@ -3554,9 +4095,7 @@ impl Render for Workspace {
 
         // Scale rem-based sizes (text_sm/text_xs etc.) with the base font
         // size; at the default size this yields the standard 16px rem.
-        window.set_rem_size(px(
-            theme::base_font_size(cx) * 16. / theme::DEFAULT_FONT_SIZE
-        ));
+        window.set_rem_size(theme::rem_size(cx));
 
         let mut root = div()
             .id("workspace")
@@ -3623,6 +4162,41 @@ impl Render for Workspace {
         root = root.child(self.render_main_pane(cx));
 
         root
+    }
+}
+
+/// The window's root view: the workspace, with gpui-component's dialog layer
+/// over it.
+///
+/// `Root` owns the dialog state but renders only the view it is handed, so
+/// placing the layers is the app's job — and they cannot be placed inside
+/// [`Workspace::render`], because drawing a dialog calls back into the
+/// workspace to build its content and gpui refuses to update an entity that
+/// is already being updated. Hence a view of its own in between: it is being
+/// updated while the layer draws, and the workspace is not.
+pub struct WindowRoot {
+    workspace: Entity<Workspace>,
+}
+
+impl WindowRoot {
+    pub fn new(workspace: Entity<Workspace>) -> Self {
+        Self { workspace }
+    }
+}
+
+impl Render for WindowRoot {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .relative()
+            .size_full()
+            .child(self.workspace.clone())
+            .children(gpui_component::Root::render_dialog_layer(window, cx).map(|layer| {
+                // Tagged so a test can assert the layer is actually placed
+                // here. `debug_selector` compiles away outside tests, and the
+                // wrapper takes no space of its own — the layer inside it
+                // positions itself against the root above.
+                div().debug_selector(|| "dialog-layer".into()).child(layer)
+            }))
     }
 }
 
@@ -3785,7 +4359,11 @@ mod tests {
         let (_root, cx) = cx.add_window_view(move |window, cx| {
             let workspace = cx.new(|cx| Workspace::new(state, state_file, cx));
             *keep.borrow_mut() = Some(workspace.clone());
-            gpui_component::Root::new(gpui::AnyView::from(workspace), window, cx)
+            // Built the same way the real window is, `WindowRoot` and all:
+            // the dialog layer is placed there, so a test window without it
+            // would pass on dialogs the app never draws.
+            let root = cx.new(|_| WindowRoot::new(workspace));
+            gpui_component::Root::new(gpui::AnyView::from(root), window, cx)
         });
         let workspace = holder.borrow().clone().expect("workspace built");
         (workspace, cx)
@@ -3803,6 +4381,15 @@ mod tests {
         });
         assert!(workspace.read_with(cx, |this, _| this.dialog.is_some()));
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        // Holding the state is not the point: `Root` draws only the view it
+        // is given, so a dialog whose layer nobody renders takes the keyboard
+        // and stays invisible — indistinguishable from a button that does
+        // nothing. Assert the layer reached the screen, not just the state.
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("dialog-layer").is_some(),
+            "the dialog layer was never drawn"
+        );
 
         cx.update(|window, cx| workspace.update(cx, |this, cx| this.close_dialog(window, cx)));
         assert!(workspace.read_with(cx, |this, _| this.dialog.is_none()));
@@ -3835,6 +4422,66 @@ mod tests {
             cx.update(|window, _| wanted.is_focused(window)),
             "the dialog took the keyboard off its own field"
         );
+    }
+
+    fn agent(name: &str, group: Option<&str>) -> AgentRecord {
+        AgentRecord {
+            id: name.to_string(),
+            name: name.to_string(),
+            description: String::new(),
+            workdir: PathBuf::from("/repo"),
+            branch: None,
+            command: None,
+            resume_command: None,
+            env: None,
+            terminals: Vec::new(),
+            group: group.map(str::to_string),
+        }
+    }
+
+    /// The sidebar draws groups from indices into two lists, so a mismatch
+    /// between them is a panic rather than a wrong pixel — this renders a
+    /// project with a folded group, an unfolded one and an empty one. It
+    /// then checks the rule that makes folding safe: an agent that becomes
+    /// the selection has its group opened, so what is on screen always has a
+    /// row in the panel.
+    #[gpui::test]
+    fn a_folded_group_still_gives_up_its_agent_when_selected(cx: &mut gpui::TestAppContext) {
+        let (workspace, cx) = test_window(cx);
+
+        workspace.update(cx, |this, cx| {
+            let mut project = ProjectRecord::new(PathBuf::from("/repo"));
+            project.groups = vec![
+                AgentGroup::new("review"),
+                AgentGroup {
+                    name: "later".into(),
+                    expanded: false,
+                },
+                AgentGroup::new("empty"),
+            ];
+            project.agents = vec![
+                agent("mine", None),
+                agent("a-review", Some("review")),
+                agent("hidden", Some("later")),
+                // Membership no group answers for: an extra row in the
+                // ungrouped run, never a row that isn't drawn at all.
+                agent("orphan", Some("gone")),
+            ];
+            project.normalize_agent_order();
+            this.state.projects = vec![project];
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        workspace.update(cx, |this, _| {
+            assert!(
+                this.reveal_agent(&"hidden".to_string()),
+                "an agent inside a folded group had nothing to unfold"
+            );
+            assert!(this.state.projects[0].groups[1].expanded);
+            // Already visible: nothing to change, and nothing to persist.
+            assert!(!this.reveal_agent(&"mine".to_string()));
+        });
     }
 
     /// Reopening the search dialog reuses the open one rather than stacking

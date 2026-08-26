@@ -32,6 +32,11 @@ pub struct AgentRecord {
     /// in the agent's workdir.
     #[serde(default)]
     pub terminals: Vec<TerminalTabRecord>,
+    /// Name of the [`AgentGroup`] this agent sits under in the sidebar.
+    /// `None` — or a name the project has no group for — is the ungrouped
+    /// run rendered above the first header.
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 /// A plain shell terminal tab attached to an agent.
@@ -39,6 +44,39 @@ pub struct AgentRecord {
 pub struct TerminalTabRecord {
     pub id: String,
     pub name: String,
+}
+
+/// A named run of agents inside a project — "review", "on hold", whatever
+/// the split is. All a group holds is a name and whether it is folded;
+/// membership lives on the agent, so an agent has exactly one home and
+/// removing it is still a single write.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct AgentGroup {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub expanded: bool,
+}
+
+impl AgentGroup {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            expanded: true,
+        }
+    }
+}
+
+/// A drag in flight over a project's agent rows, as the sidebar previews it.
+pub struct PendingAgentMove<'a> {
+    /// The agent being dragged.
+    pub from: &'a AgentId,
+    /// The row it takes the place of. `None` means the pointer is on a group
+    /// header, which drops at the top of that group — the only way to fill a
+    /// group that has no rows to aim at.
+    pub to: Option<&'a AgentId>,
+    /// The group the dragged row lands in: the one owning `to`, or the
+    /// hovered header's.
+    pub group: Option<&'a str>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -49,6 +87,11 @@ pub struct ProjectRecord {
     pub agents: Vec<AgentRecord>,
     #[serde(default = "default_true")]
     pub expanded: bool,
+    /// Groups, in the order their headers appear. Absent from old state
+    /// files, and empty for a project nobody has grouped — which renders
+    /// exactly as it did before groups existed.
+    #[serde(default)]
+    pub groups: Vec<AgentGroup>,
 }
 
 fn default_true() -> bool {
@@ -66,7 +109,152 @@ impl ProjectRecord {
             name,
             agents: Vec::new(),
             expanded: true,
+            groups: Vec::new(),
         }
+    }
+
+    pub fn group_index(&self, name: &str) -> Option<usize> {
+        self.groups.iter().position(|group| group.name == name)
+    }
+
+    /// The group an agent actually renders under. A name no group has counts
+    /// as ungrouped: a hand-edited state file should cost the grouping, not
+    /// the row.
+    pub fn group_of<'a>(&self, agent: &'a AgentRecord) -> Option<&'a str> {
+        agent
+            .group
+            .as_deref()
+            .filter(|name| self.group_index(name).is_some())
+    }
+
+    /// A name no other group is using. Membership is by name, so two groups
+    /// sharing one would each claim the other's agents.
+    pub fn unique_group_name(&self, wanted: &str, except: Option<usize>) -> String {
+        let taken = |name: &str| {
+            self.groups
+                .iter()
+                .enumerate()
+                .any(|(index, group)| Some(index) != except && group.name == name)
+        };
+        if !taken(wanted) {
+            return wanted.to_string();
+        }
+        (2..)
+            .map(|n| format!("{wanted} {n}"))
+            .find(|candidate| !taken(candidate))
+            .unwrap_or_else(|| wanted.to_string())
+    }
+
+    /// Rename a group, carrying its agents with it.
+    pub fn rename_group(&mut self, index: usize, name: &str) {
+        if self.groups.get(index).is_none() {
+            return;
+        }
+        let name = self.unique_group_name(name, Some(index));
+        let old = std::mem::replace(&mut self.groups[index].name, name.clone());
+        for agent in &mut self.agents {
+            if agent.group.as_deref() == Some(old.as_str()) {
+                agent.group = Some(name.clone());
+            }
+        }
+    }
+
+    /// Delete a group, leaving its agents in the project as ungrouped rows.
+    /// Dissolving a group must never remove work.
+    pub fn remove_group(&mut self, index: usize) {
+        if index >= self.groups.len() {
+            return;
+        }
+        let group = self.groups.remove(index);
+        for agent in &mut self.agents {
+            if agent.group.as_deref() == Some(group.name.as_str()) {
+                agent.group = None;
+            }
+        }
+        self.normalize_agent_order();
+    }
+
+    /// Where an agent sorts in the sidebar: the ungrouped run first, then
+    /// each group in `groups` order.
+    fn agent_rank(&self, agent: &AgentRecord) -> usize {
+        self.group_of(agent)
+            .and_then(|name| self.group_index(name))
+            .map_or(0, |index| index + 1)
+    }
+
+    /// Keep the stored order equal to the displayed order: ungrouped rows,
+    /// then each group's members contiguously. Holding this invariant is what
+    /// lets the drag code keep working in plain list indices.
+    pub fn normalize_agent_order(&mut self) {
+        let ranks: Vec<usize> = self.agents.iter().map(|a| self.agent_rank(a)).collect();
+        let mut ranked: Vec<(usize, AgentRecord)> =
+            ranks.into_iter().zip(self.agents.drain(..)).collect();
+        // Stable, so the order *within* each run survives the partition.
+        ranked.sort_by_key(|(rank, _)| *rank);
+        self.agents = ranked.into_iter().map(|(_, agent)| agent).collect();
+    }
+
+    /// Repair what a state file should never contain: unnamed groups (an
+    /// inline rename the app died in the middle of), two groups with one
+    /// name, and membership pointing at neither.
+    pub fn normalize(&mut self) {
+        let mut kept: Vec<String> = Vec::new();
+        self.groups.retain(|group| {
+            let keep = !group.name.trim().is_empty() && !kept.contains(&group.name);
+            if keep {
+                kept.push(group.name.clone());
+            }
+            keep
+        });
+        for agent in &mut self.agents {
+            if let Some(name) = agent.group.as_deref() {
+                if !kept.iter().any(|kept| kept == name) {
+                    agent.group = None;
+                }
+            }
+        }
+        self.normalize_agent_order();
+    }
+
+    /// The agents in display order with a pending drag applied, as
+    /// `(index into `agents`, the group that row renders under)`. The sidebar
+    /// draws from this so a drag shows its result — new position *and* new
+    /// group — before the drop lands.
+    pub fn previewed_agents(
+        &self,
+        pending: Option<PendingAgentMove<'_>>,
+    ) -> Vec<(usize, Option<String>)> {
+        let mut rows: Vec<(usize, Option<String>)> = self
+            .agents
+            .iter()
+            .enumerate()
+            .map(|(index, agent)| (index, self.group_of(agent).map(str::to_string)))
+            .collect();
+        let Some(pending) = pending else {
+            return rows;
+        };
+        let id_at = |rows: &[(usize, Option<String>)], id: &AgentId| {
+            rows.iter()
+                .position(|(index, _)| &self.agents[*index].id == id)
+        };
+        let Some(at) = id_at(&rows, pending.from) else {
+            return rows;
+        };
+        let mut moved = rows.remove(at);
+        moved.1 = pending.group.map(str::to_string);
+        let insert = match pending.to {
+            Some(to) => id_at(&rows, to),
+            // Dropped on a header: the top of that group's run. An empty
+            // group has no run to find, and the index then doesn't matter —
+            // rows are drawn per group, so it lands under that header either
+            // way.
+            None => rows
+                .iter()
+                .position(|(_, group)| group.as_deref() == pending.group),
+        }
+        .unwrap_or(rows.len());
+        rows.insert(insert, moved);
+        rows
     }
 }
 
@@ -709,13 +897,145 @@ fn parse_state(contents: &str) -> Result<AppState> {
             }
         }
     }
+    // A hand-edited state file can name a group twice, leave one unnamed, or
+    // point an agent at a group that isn't there. None of that should cost a
+    // row, so it is straightened out on the way in rather than guarded against
+    // at every use.
+    for project in &mut state.projects {
+        project.normalize();
+    }
     Ok(state)
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A project holding `agents`, each written as `name` or `name@group`.
+    fn project(groups: &[&str], agents: &[&str]) -> ProjectRecord {
+        let mut project = ProjectRecord::new(PathBuf::from("/repo"));
+        project.groups = groups.iter().map(|name| AgentGroup::new(*name)).collect();
+        project.agents = agents
+            .iter()
+            .map(|spec| {
+                let (name, group) = match spec.split_once('@') {
+                    Some((name, group)) => (name, Some(group.to_string())),
+                    None => (*spec, None),
+                };
+                AgentRecord {
+                    id: name.to_string(),
+                    name: name.to_string(),
+                    description: String::new(),
+                    workdir: PathBuf::from("/repo"),
+                    branch: None,
+                    command: None,
+                    resume_command: None,
+                    env: None,
+                    terminals: Vec::new(),
+                    group,
+                }
+            })
+            .collect();
+        project
+    }
+
+    /// The agents as the sidebar would draw them: `name@group`, ungrouped
+    /// first, then each group's run.
+    fn shown(project: &ProjectRecord, pending: Option<PendingAgentMove<'_>>) -> Vec<String> {
+        project
+            .previewed_agents(pending)
+            .into_iter()
+            .map(|(index, group)| match group {
+                Some(group) => format!("{}@{group}", project.agents[index].name),
+                None => project.agents[index].name.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn agents_are_stored_in_the_order_they_are_shown() {
+        // Interleaved on the way in; the ungrouped run and each group's
+        // members come out contiguous and in `groups` order.
+        let mut project = project(&["review", "later"], &["a@review", "b", "c@later", "d@review"]);
+        project.normalize_agent_order();
+        let order: Vec<&str> = project.agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(order, ["b", "a", "d", "c"]);
+        // Stable: `a` was before `d` in the input and stays before it.
+        assert_eq!(shown(&project, None), ["b", "a@review", "d@review", "c@later"]);
+    }
+
+    #[test]
+    fn a_pending_drag_shows_its_new_position_and_group() {
+        let project = project(&["review"], &["a", "b", "c@review"]);
+        // Dropping `a` onto `c` puts it where `c` is, in `c`'s group.
+        let moved = shown(
+            &project,
+            Some(PendingAgentMove {
+                from: &"a".to_string(),
+                to: Some(&"c".to_string()),
+                group: Some("review"),
+            }),
+        );
+        assert_eq!(moved, ["b", "a@review", "c@review"]);
+
+        // Dropping on the header lands at the top of the group instead.
+        let onto_header = shown(
+            &project,
+            Some(PendingAgentMove {
+                from: &"b".to_string(),
+                to: None,
+                group: Some("review"),
+            }),
+        );
+        assert_eq!(onto_header, ["a", "b@review", "c@review"]);
+    }
+
+    #[test]
+    fn dropping_on_an_empty_groups_header_still_lands_in_it() {
+        let project = project(&["review"], &["a", "b"]);
+        let moved = shown(
+            &project,
+            Some(PendingAgentMove {
+                from: &"a".to_string(),
+                to: None,
+                group: Some("review"),
+            }),
+        );
+        assert_eq!(moved, ["b", "a@review"]);
+    }
+
+    #[test]
+    fn dissolving_a_group_keeps_its_agents() {
+        let mut project = project(&["review", "later"], &["a", "b@review", "c@later"]);
+        project.remove_group(0);
+        assert_eq!(project.groups.len(), 1);
+        // `b` is still here, back in the ungrouped run at the top.
+        assert_eq!(shown(&project, None), ["a", "b", "c@later"]);
+    }
+
+    #[test]
+    fn renaming_a_group_carries_its_agents() {
+        let mut project = project(&["review"], &["a@review"]);
+        project.rename_group(0, "to review");
+        assert_eq!(shown(&project, None), ["a@to review"]);
+
+        // A name another group already has would make membership ambiguous,
+        // so it is made unique rather than allowed to collide.
+        project.groups.push(AgentGroup::new("later"));
+        project.rename_group(1, "to review");
+        assert_eq!(project.groups[1].name, "to review 2");
+    }
+
+    #[test]
+    fn a_state_file_never_costs_a_row() {
+        let mut project = project(&["review", "review", ""], &["a@nonexistent", "b@review"]);
+        project.normalize();
+        // The duplicate and the unnamed group are dropped…
+        assert_eq!(project.groups.len(), 1);
+        // …and an agent pointing at a group that isn't there is ungrouped
+        // rather than lost.
+        assert_eq!(shown(&project, None), ["a", "b@review"]);
+    }
 
     #[test]
     fn program_availability_matches_what_exec_would_find() {

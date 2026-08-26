@@ -162,10 +162,12 @@ fn main() {
                         true
                     }
                 });
-                // gpui-component renders dialogs, notifications and popups
-                // into layers owned by `Root`, so it has to be the window's
-                // root element with our workspace inside it.
-                cx.new(|cx| gpui_component::Root::new(gpui::AnyView::from(workspace), window, cx))
+                // gpui-component keeps dialog state on `Root`, so it has to be
+                // the window's root element — but it draws only the view it is
+                // given, so `WindowRoot` sits in between and places the dialog
+                // layer over the workspace.
+                let root = cx.new(|_| workspace::WindowRoot::new(workspace));
+                cx.new(|cx| gpui_component::Root::new(gpui::AnyView::from(root), window, cx))
             },
         )
         .expect("failed to open window");

@@ -45,9 +45,7 @@ impl Render for Fatal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Same rem scaling as the workspace, so this window's text matches the
         // rest of the app at whatever font size is configured.
-        window.set_rem_size(px(
-            theme::base_font_size(cx) * 16. / theme::DEFAULT_FONT_SIZE
-        ));
+        window.set_rem_size(theme::rem_size(cx));
 
         div()
             .id("fatal")

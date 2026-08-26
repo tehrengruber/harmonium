@@ -118,14 +118,34 @@ pub fn base_font_size(cx: &App) -> f32 {
         .clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
 }
 
-/// UI text size (sidebar, dialogs, headers).
-pub fn ui_font_size(cx: &App) -> Pixels {
-    px(base_font_size(cx))
+/// The rem the window is scaled to, and the one scale every size in the UI
+/// is drawn from — text through the sizes below, spacing and icons through
+/// gpui's own rem units (`px_2`, `size_3`, `text_sm`). One scale is the point:
+/// a size defined outside it keeps its own pace as the setting moves, and the
+/// UI comes apart at every setting except the one it was drawn at.
+pub fn rem_size(cx: &App) -> Pixels {
+    px(base_font_size(cx) * 16. / DEFAULT_FONT_SIZE)
 }
 
-/// Terminal cell font size: slightly larger than the UI text.
+/// UI text size (sidebar, dialogs, headers) — the same step as `text_sm`,
+/// which is what nearly every element in the app asks for. Set as the window's
+/// default too, so text that names no size of its own matches the text it sits
+/// beside instead of coming out a step smaller.
+pub fn ui_font_size(cx: &App) -> Pixels {
+    rem_size(cx) * 0.875
+}
+
+/// Small-label text — sidebar group headers and the like. Under the UI size
+/// so a label reads as a label rather than as another row, with a floor so it
+/// stays legible when the whole UI is scaled down.
+pub fn label_font_size(cx: &App) -> Pixels {
+    px(f32::from(rem_size(cx) * 0.625).max(MIN_FONT_SIZE))
+}
+
+/// Terminal cell font size: a step under the UI text, where a monospace face
+/// of the same nominal size reads larger.
 pub fn terminal_font_size(cx: &App) -> Pixels {
-    px(base_font_size(cx) + 1.)
+    rem_size(cx) * 0.8125
 }
 
 pub fn bg() -> Hsla {
@@ -148,6 +168,12 @@ pub fn fg_dim() -> Hsla {
 }
 pub fn border() -> Hsla {
     pick(0x3f4451, 0xd0d3d9)
+}
+/// A hairline weaker than [`border`], for rules that divide *within* a panel
+/// rather than between panels — a 1px line is already the thinnest thing the
+/// display can draw, so the only way left to make one lighter is its colour.
+pub fn rule() -> Hsla {
+    pick(0x2f343c, 0xdcdee3)
 }
 pub fn accent() -> Hsla {
     pick(0x4aa5f0, 0x2b6fd0)
@@ -182,3 +208,37 @@ pub fn terminal_font() -> Font {
     ))
 }
 
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every text size in the UI is a fixed fraction of one rem, so moving
+    /// the font-size setting moves all of them by the same factor. A size
+    /// defined outside that scale is how a UI comes apart at every setting
+    /// except the one someone happened to draw it at.
+    #[gpui::test]
+    fn text_sizes_all_move_with_the_setting(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let sizes = |base: f32, cx: &mut App| {
+                cx.set_global(FontSettings { base });
+                [rem_size(cx), ui_font_size(cx), terminal_font_size(cx), label_font_size(cx)]
+            };
+
+            // At the default setting the app draws what it has always drawn,
+            // and `ui_font_size` is the step `text_sm` resolves to (0.875rem)
+            // rather than a second opinion about how big UI text is.
+            assert_eq!(
+                sizes(DEFAULT_FONT_SIZE, cx),
+                [px(16.), px(14.), px(13.), px(10.)]
+            );
+
+            // Double the setting and every size doubles with it.
+            assert_eq!(
+                sizes(DEFAULT_FONT_SIZE * 2., cx),
+                [px(32.), px(28.), px(26.), px(20.)]
+            );
+        });
+    }
+}

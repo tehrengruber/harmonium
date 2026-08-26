@@ -53,6 +53,15 @@ refused in either case, with the dialog left open and the occupying task
 reword this one onto a different branch (when the clash is on a branch) or
 pick *New worktree* (when it is on the main checkout).
 
+**Groups** split a project's agents into named runs — work you are only
+reviewing, kept apart from work you are doing. *New group* under a project
+creates one and opens its name for editing; drag agents onto it (or onto its
+header, which drops at the top) to move them in, and click the header to fold
+the run away, leaving just the label. The `+` on a header spawns straight into
+that group. Ungrouped agents stay at the top with no header, so
+a project you never group looks exactly as it did before. Deleting a group
+(`×`) only dissolves it — its agents return to the ungrouped run.
+
 Removing an agent (the `×` in the sidebar) deletes its worktree too, but only
 if that worktree is **clean** — staged, modified or untracked files block the
 removal with a message naming the directory, since killing the session and

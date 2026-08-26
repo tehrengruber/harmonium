@@ -95,7 +95,7 @@ impl Render for Fatal {
                                 .id("fatal-quit")
                                 .px_3()
                                 .py_1()
-                                .rounded_sm()
+                                .rounded(theme::CORNER_RADIUS)
                                 .bg(theme::accent())
                                 .text_color(theme::panel_bg())
                                 .cursor_pointer()

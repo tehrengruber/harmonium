@@ -14,7 +14,7 @@ use gpui::{
     Styled as _, Subscription, Task, WeakEntity, Window,
 };
 
-use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
+use gpui_component::input::{InputEvent, InputState, SelectAll};
 use gpui_component::WindowExt as _;
 
 use crate::dialogs::{
@@ -31,6 +31,7 @@ use crate::state;
 use crate::terminal::view::TerminalView;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::theme;
+use crate::ui;
 
 const MIN_SIDEBAR_WIDTH: f32 = 180.;
 const MAX_SIDEBAR_WIDTH: f32 = 600.;
@@ -345,6 +346,10 @@ impl Workspace {
         let new_size = (theme::base_font_size(cx) + delta)
             .clamp(theme::MIN_FONT_SIZE, theme::MAX_FONT_SIZE);
         cx.set_global(theme::FontSettings { base: new_size });
+        // The corner radius the library's widgets round by is a fraction of
+        // the rem resolved to pixels, so it has to be re-resolved whenever
+        // the rem moves.
+        theme::sync_component_theme(cx);
         self.state.settings.font_size = new_size;
         self.persist(cx);
         // Terminals re-measure their cell size on next paint; wake them up.
@@ -487,7 +492,7 @@ impl Workspace {
                 .id(id)
                 .px_2()
                 .py_0p5()
-                .rounded_sm()
+                .rounded(theme::CORNER_RADIUS)
                 .text_xs()
                 .text_color(theme::fg_dim())
                 .cursor_pointer()
@@ -711,7 +716,7 @@ impl Workspace {
             .items_center()
             .gap_1()
             .px_2()
-            .rounded_sm()
+            .rounded(theme::CORNER_RADIUS)
             .cursor_pointer()
             .hover(|s| s.bg(theme::hover_bg()))
     }
@@ -736,7 +741,7 @@ impl Workspace {
             .id(id)
             .flex_none()
             .px_1()
-            .rounded_sm()
+            .rounded(theme::CORNER_RADIUS)
             // The same size as the label beside it, so a glyph action sits
             // on the row's text metrics instead of the panel's default.
             .text_sm()
@@ -1948,7 +1953,7 @@ impl Workspace {
                         .id("expand-sidebar")
                         .mb_2()
                         .px_1()
-                        .rounded_sm()
+                        .rounded(theme::CORNER_RADIUS)
                         .cursor_pointer()
                         .text_color(theme::fg_dim())
                         .hover(|s| s.bg(theme::hover_bg()).text_color(theme::fg()))
@@ -2151,7 +2156,7 @@ impl Workspace {
                                         }
                                     },
                                 ))
-                                .child(Input::new(&edit.input)),
+                                .child(ui::field(&edit.input)),
                         );
                         continue;
                     }
@@ -2372,7 +2377,7 @@ impl Workspace {
                                     .id("collapse-sidebar")
                                     .px_1()
                                     .py_0p5()
-                                    .rounded_sm()
+                                    .rounded(theme::CORNER_RADIUS)
                                     .text_color(theme::fg_dim())
                                     .text_sm()
                                     .cursor_pointer()
@@ -2395,7 +2400,7 @@ impl Workspace {
                                     .id("toggle-log")
                                     .px_2()
                                     .py_0p5()
-                                    .rounded_sm()
+                                    .rounded(theme::CORNER_RADIUS)
                                     .text_sm()
                                     .cursor_pointer()
                                     .text_color(if self.state.settings.log_panel_open {
@@ -2414,7 +2419,7 @@ impl Workspace {
                             .id("open-settings")
                             .px_2()
                             .py_0p5()
-                            .rounded_sm()
+                            .rounded(theme::CORNER_RADIUS)
                             .text_color(theme::fg_dim())
                             .cursor_pointer()
                             .hover(|s| s.bg(theme::hover_bg()).text_color(theme::fg()))
@@ -2462,7 +2467,7 @@ impl Workspace {
                         }
                     },
                 ))
-                .child(Input::new(&edit.input))
+                .child(ui::field(&edit.input))
                 .into_any_element();
         }
 
@@ -2923,14 +2928,11 @@ impl Workspace {
                                     .child("No live session for this agent."),
                             )
                             .child(
-                                div()
-                                    .id("resume-agent")
+                                ui::control("resume-agent")
                                     .px_3()
-                                    .py_1()
-                                    .rounded_sm()
                                     .bg(theme::selected_bg())
+                                    .border_color(theme::border())
                                     .text_color(theme::accent())
-                                    .cursor_pointer()
                                     .hover(|s| s.bg(theme::hover_bg()))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.resume_agent(resume_id.clone(), cx);

@@ -1,7 +1,10 @@
 //! Centralized colors and fonts. Two palettes (One Light-ish / One Dark-ish)
 //! selected by a runtime theme mode.
 
-use gpui::{px, rgb, App, Font, FontFeatures, FontStyle, FontWeight, Global, Hsla, Pixels, SharedString};
+use gpui::{
+    px, rgb, App, Font, FontFeatures, FontStyle, FontWeight, Global, Hsla, Pixels, Rems,
+    SharedString,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
@@ -78,14 +81,42 @@ pub fn set_mode(mode: ThemeMode, cx: &mut App) {
 }
 
 /// Point gpui-component's semantic theme at the same light/dark mode as our
-/// own palette. [`set_mode`] does this for you; call it directly only to
-/// align the library with the mode already in force, as at startup.
+/// own palette, and re-resolve the metrics below. [`set_mode`] does this for
+/// you; call it directly only to align the library with what is already in
+/// force — at startup, or after the font size moves, which changes the rem
+/// the radius is resolved from.
 pub fn sync_component_theme(cx: &mut App) {
     let mode = match mode() {
         ThemeMode::Dark => gpui_component::ThemeMode::Dark,
         ThemeMode::Light => gpui_component::ThemeMode::Light,
     };
     gpui_component::Theme::change(mode, None, cx);
+    // After `change`, and again on every call: it ends in `apply_config`,
+    // which rewrites each metric from a freshly built default, so a radius
+    // set here is stamped back to the library's 6px/8px by the next theme
+    // toggle. Resolved to pixels because that is what its theme holds; the
+    // fraction is the one our own chrome rounds by, so a library widget and
+    // the chip beside it match.
+    //
+    // TODO(upstream): report to gpui-component (0.5.1,
+    // github.com/longbridge/gpui-component) — the theme owns metrics an app
+    // has no supported way to set.
+    //
+    //  * `radius`/`radius_lg` can only come from a theme *file*, as a whole
+    //    number of pixels (`ThemeConfig::radius: Option<usize>`). There is
+    //    no API for "round everything by this", and an assignment to the
+    //    global does not survive `Theme::change`, which is the very call an
+    //    app makes to follow the system appearance.
+    //  * `Theme` carries `font_size` but no line height, while `Input`
+    //    hard-codes its own — see [`CONTROL_LINE_HEIGHT`].
+    //
+    // Both decide how tall a control comes out, so an app drawing its own
+    // chrome beside the library's widgets has to guess at them to line
+    // anything up. Until they are settable, this override stands.
+    let radius = corner_radius(cx);
+    let theme = gpui_component::Theme::global_mut(cx);
+    theme.radius = radius;
+    theme.radius_lg = radius;
 }
 
 pub fn mode() -> ThemeMode {
@@ -152,6 +183,31 @@ pub fn label_font_size(cx: &App) -> Pixels {
 /// of the same nominal size reads larger.
 pub fn terminal_font_size(cx: &App) -> Pixels {
     rem_size(cx) * 0.8125
+}
+
+/// Corner radius, for everything the app rounds. One step off a square
+/// corner and no further — 2px at the default font size — so a rounded box
+/// reads as a box with its edge taken off rather than as a pill. In rems
+/// like every other size here, so it keeps its proportion to the text as the
+/// font-size setting moves.
+pub const CORNER_RADIUS: Rems = Rems(0.125);
+
+/// The line box a one-line control draws its text in — chips, buttons and
+/// text fields alike. Matching it is what makes a chip exactly as tall as
+/// the field beside it; see [`crate::ui`].
+///
+/// The number is a copy of a private `const LINE_HEIGHT: Rems = Rems(1.25)`
+/// inside gpui-component's `Input::render`, not a value we are free to pick:
+/// a gpui `div` defaults to `phi()` instead, which at our text size is a
+/// 23px line box against the field's 20px. Nothing here fails to compile if
+/// they change it upstream — the chips just quietly stop matching the
+/// fields. See the TODO in [`sync_component_theme`].
+pub const CONTROL_LINE_HEIGHT: Rems = Rems(1.25);
+
+/// [`CORNER_RADIUS`] resolved against the current rem, for gpui-component's
+/// theme, which holds pixels rather than a rem fraction.
+pub fn corner_radius(cx: &App) -> Pixels {
+    CORNER_RADIUS.to_pixels(rem_size(cx))
 }
 
 pub fn bg() -> Hsla {
@@ -245,6 +301,34 @@ mod tests {
                 sizes(DEFAULT_FONT_SIZE * 2., cx),
                 [px(32.), px(28.), px(26.), px(20.)]
             );
+        });
+    }
+
+    /// The radius gpui-component's widgets round by is the one place in the
+    /// UI where a size leaves our rem scale and becomes fixed pixels, so it
+    /// has to be re-resolved whenever the rem moves — and it has to survive
+    /// `Theme::change`, which rewrites every metric from the library's own
+    /// defaults. Both halves have gone wrong in a way nothing else catches:
+    /// the widgets keep rounding by a stale radius while the chrome beside
+    /// them scales, which reads as a rendering glitch, not a bug.
+    #[gpui::test]
+    fn component_radius_follows_the_font_size(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let radius = |base: f32, cx: &mut App| {
+                cx.set_global(FontSettings { base });
+                sync_component_theme(cx);
+                let theme = gpui_component::Theme::global(cx);
+                (theme.radius, theme.radius_lg)
+            };
+
+            assert_eq!(radius(DEFAULT_FONT_SIZE, cx), (px(2.), px(2.)));
+            assert_eq!(radius(DEFAULT_FONT_SIZE * 2., cx), (px(4.), px(4.)));
+
+            // Not the library's own 6px/8px, which is what a `change` after
+            // the override — or no override at all — leaves behind.
+            let (r, r_lg) = radius(DEFAULT_FONT_SIZE, cx);
+            assert!(r != px(6.) && r_lg != px(8.));
         });
     }
 }

@@ -17,11 +17,12 @@ use gpui::{
     Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
 };
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{InputEvent, InputState};
 
 use crate::planner;
 use crate::state::{PresetRecord, SettingsRecord, WorkspaceMode};
 use crate::theme;
+use crate::ui;
 
 /// Rows the task field grows to before it scrolls instead. Without a cap a
 /// long description pushes the Spawn button off the bottom of the window.
@@ -42,19 +43,20 @@ fn ellipsize(text: &str, max_chars: usize) -> String {
     format!("{}…", kept.trim_end())
 }
 
-/// One selector chip, styled the same in every dialog.
+/// One selector chip, styled the same in every dialog. Drawn on the shared
+/// control metric (see [`crate::ui`]), so it is the same size as the field
+/// above it and says what it is with colour alone.
 fn chip(id: impl Into<ElementId>, selected: bool) -> Stateful<Div> {
-    div()
-        .id(id)
-        .px_2()
-        .py_0p5()
-        .rounded_sm()
-        .text_sm()
-        .cursor_pointer()
+    ui::control(id)
         .bg(if selected {
             theme::accent()
         } else {
             theme::selected_bg()
+        })
+        .border_color(if selected {
+            theme::accent()
+        } else {
+            theme::border()
         })
         .text_color(if selected {
             theme::panel_bg()
@@ -148,26 +150,22 @@ fn dialog_buttons<V: 'static>(
         // the body above them is far taller than the window.
         .debug_selector(|| "dialog-buttons".into())
         .child(
-            div()
-                .id("dialog-cancel")
+            // Wider than a chip — a button's label wants room around it —
+            // but the same height, so the button row and the chip rows above
+            // it are the same run of controls.
+            ui::control("dialog-cancel")
                 .px_3()
-                .py_1()
-                .rounded_sm()
                 .text_color(theme::fg_dim())
-                .cursor_pointer()
                 .hover(|s| s.bg(theme::hover_bg()))
                 .on_click(cx.listener(move |this, _, window, cx| cancel(this, window, cx)))
                 .child("Cancel"),
         )
         .child(
-            div()
-                .id("dialog-submit")
+            ui::control("dialog-submit")
                 .px_3()
-                .py_1()
-                .rounded_sm()
                 .bg(theme::accent())
+                .border_color(theme::accent())
                 .text_color(theme::panel_bg())
-                .cursor_pointer()
                 .hover(|s| s.opacity(0.9))
                 .on_click(cx.listener(move |this, _, window, cx| submit(this, window, cx)))
                 .child(submit_label),
@@ -253,7 +251,7 @@ impl NewAgentDialog {
 
 impl Render for NewAgentDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut panel = dialog_body("new-agent-body").child(Input::new(&self.input));
+        let mut panel = dialog_body("new-agent-body").child(ui::field(&self.input));
 
         // Preset selector.
         let mut chips = div().flex().flex_wrap().items_center().gap_1().child(
@@ -385,7 +383,7 @@ impl SearchDialog {
 impl Render for SearchDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut panel = dialog_body("search-body")
-            .child(Input::new(&self.input))
+            .child(ui::field(&self.input))
             .child(
                 div()
                     .flex()
@@ -420,17 +418,14 @@ impl Render for SearchDialog {
         }
 
         let button = |id: &'static str, label: &'static str, primary: bool| {
-            div()
-                .id(id)
+            ui::control(id)
                 .px_3()
-                .py_1()
-                .rounded_sm()
-                .cursor_pointer()
                 .bg(if primary {
                     theme::accent()
                 } else {
                     theme::selected_bg()
                 })
+                .border_color(if primary { theme::accent() } else { theme::border() })
                 .text_color(if primary { theme::panel_bg() } else { theme::fg() })
                 .hover(|s| s.opacity(0.9))
                 .child(label)
@@ -453,12 +448,8 @@ impl Render for SearchDialog {
                     // rather than two, but the row plays the same part.
                     .debug_selector(|| "dialog-buttons".into())
                     .child(
-                        div()
-                            .id("search-close")
+                        ui::control("search-close")
                             .px_3()
-                            .py_1()
-                            .rounded_sm()
-                            .cursor_pointer()
                             .text_color(theme::fg_dim())
                             .hover(|s| s.text_color(theme::fg()))
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(SearchEvent::Close)))
@@ -696,13 +687,11 @@ impl SettingsDialog {
                     .child("Base font size"),
             )
             .child(
-                div()
-                    .id("font-size-dec")
+                ui::control("font-size-dec")
                     .px_2()
-                    .rounded_sm()
                     .bg(theme::selected_bg())
+                    .border_color(theme::border())
                     .text_color(theme::fg())
-                    .cursor_pointer()
                     .hover(|s| s.bg(theme::hover_bg()))
                     .on_click(cx.listener(|_, _, _, cx| {
                         cx.emit(SettingsEvent::AdjustFontSize(-1.));
@@ -718,13 +707,11 @@ impl SettingsDialog {
                     .child(SharedString::from(format!("{base:.0}"))),
             )
             .child(
-                div()
-                    .id("font-size-inc")
+                ui::control("font-size-inc")
                     .px_2()
-                    .rounded_sm()
                     .bg(theme::selected_bg())
+                    .border_color(theme::border())
                     .text_color(theme::fg())
-                    .cursor_pointer()
                     .hover(|s| s.bg(theme::hover_bg()))
                     .on_click(cx.listener(|_, _, _, cx| {
                         cx.emit(SettingsEvent::AdjustFontSize(1.));
@@ -821,7 +808,7 @@ impl Render for SettingsDialog {
                         .text_xs()
                         .child(text),
                 )
-                .child(div().flex_1().min_w_0().child(Input::new(input)))
+                .child(div().flex_1().min_w_0().child(ui::field(input)))
         };
         let mut preset_list = div().flex().flex_col().gap_2();
         for (index, inputs) in self.preset_inputs.iter().enumerate() {
@@ -839,7 +826,7 @@ impl Render for SettingsDialog {
                     .flex_col()
                     .gap_1()
                     .p_2()
-                    .rounded_sm()
+                    .rounded(theme::CORNER_RADIUS)
                     .border_1()
                     .border_color(theme::border())
                     .child(
@@ -848,12 +835,12 @@ impl Render for SettingsDialog {
                             .items_center()
                             .gap_2()
                             .child(label("Name"))
-                            .child(div().flex_1().min_w_0().child(Input::new(&inputs.name)))
+                            .child(div().flex_1().min_w_0().child(ui::field(&inputs.name)))
                             .child(
                                 div()
                                     .id(("preset-remove", index))
                                     .px_1()
-                                    .rounded_sm()
+                                    .rounded(theme::CORNER_RADIUS)
                                     .text_color(theme::fg_dim())
                                     .cursor_pointer()
                                     .hover(|s| {
@@ -871,7 +858,7 @@ impl Render for SettingsDialog {
                             .items_center()
                             .gap_2()
                             .child(label("Command"))
-                            .child(div().flex_1().min_w_0().child(Input::new(&inputs.command))),
+                            .child(div().flex_1().min_w_0().child(ui::field(&inputs.command))),
                     )
                     .child(
                         div()
@@ -879,7 +866,7 @@ impl Render for SettingsDialog {
                             .items_center()
                             .gap_2()
                             .child(label("Env"))
-                            .child(div().flex_1().min_w_0().child(Input::new(&inputs.env))),
+                            .child(div().flex_1().min_w_0().child(ui::field(&inputs.env))),
                     ),
             );
         }
@@ -936,14 +923,9 @@ impl Render for SettingsDialog {
                     )
                     .child(preset_list)
                     .child(
-                        div()
-                            .id("preset-add")
+                        ui::control("preset-add")
                             .px_2()
-                            .py_0p5()
-                            .rounded_sm()
                             .text_color(theme::accent())
-                            .text_sm()
-                            .cursor_pointer()
                             .hover(|s| s.bg(theme::hover_bg()))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.add_preset_row(window, cx);

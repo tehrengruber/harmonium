@@ -138,6 +138,10 @@ fn dialog_buttons<V: 'static>(
 ) -> impl IntoElement {
     div()
         .flex()
+        // Wrapped for the same reason the chip rows are: a row justified to
+        // the end overflows off the left of the panel, where the buttons
+        // cannot be clicked.
+        .flex_wrap()
         .gap_2()
         .justify_end()
         // Tagged so a test can assert the buttons are still on screen when
@@ -437,6 +441,11 @@ impl Render for SearchDialog {
             .child(
                 div()
                     .flex()
+                    // Three buttons at a large font are wider than a 460px
+                    // dialog, and an unwrapped row overflows to the *left*
+                    // (it is justified to the end), taking Close off the
+                    // panel entirely. Wrapping keeps every button reachable.
+                    .flex_wrap()
                     .items_center()
                     .justify_end()
                     .gap_2()

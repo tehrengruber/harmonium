@@ -19,9 +19,9 @@ claude-container-isolation (claude-isol).
 
 ## Environment quirks
 
-- `$HOME` is not writable → rustup fails. Install Rust via pacman instead, and
-  set `CARGO_HOME` to a writable path inside the workdir:
-  `export CARGO_HOME=$PWD/.cargo-home`
+- `$HOME` is not writable → rustup fails. Install Rust via pacman instead
+  (see the setup block below); **never** point `CARGO_HOME` at `$PWD` to work
+  around it — see the build precondition below.
 - `/tmp/.X11-unix` cannot be created (non-root euid) → Xvfb works but with a
   warning; unix sockets must live in a **short** path (108-char AF_UNIX limit),
   so use e.g. `XDG_RUNTIME_DIR=/tmp/claude-1000/xrt`, NOT the deep scratchpad.
@@ -31,6 +31,29 @@ claude-container-isolation (claude-isol).
   use `grim` (Wayland) or netpbm/custom converter (X11).
 - No GPU: install `vulkan-swrast` (lavapipe). GPUI/blade picks it up
   automatically ("Adapter: llvmpipe").
+
+## Before you build: the cargo environment must already be set
+
+Check `env | grep CARGO` first. If `CARGO_TARGET_DIR` is not set, **stop and
+ask the user for `.claude/settings.local.json`** — do not build, and do not
+export the variables by hand for one command. The file is personal and
+gitignored, so a fresh worktree does not have it, and it must read:
+
+```json
+{
+  "env": {
+    "CARGO_HOME": "<git root>/.cargo-home",
+    "CARGO_TARGET_DIR": "<git root>/target"
+  }
+}
+```
+
+`<git root>` is what `git rev-parse --path-format=absolute --git-common-dir`
+prints, minus the trailing `/.git` — the main checkout, which is bind-mounted
+and shared by every worktree. Without it cargo falls back to `~/.cargo` and the
+worktree's own `target/`, both tmpfs: the registry is re-downloaded and gpui,
+wgpu and alacritty_terminal are recompiled from scratch into RAM, ten-odd
+minutes of work thrown away when the session ends.
 
 ## One-time setup (pacman)
 
@@ -88,6 +111,12 @@ terminal — click inside the terminal area before sending keys.
 ```bash
 export XDG_RUNTIME_DIR=/tmp/claude-1000/xrt WAYLAND_DISPLAY=wayland-1
 export XDG_CACHE_HOME=/tmp/claude-1000/cache   # HOME/.cache not writable
+# Never let a test instance near the real session: without this it opens
+# ~/.local/share/harmonium, takes the session lock the running harmonium
+# needs, and saves whatever the test did over the user's projects on the way
+# out. A binary is a binary — the cfg(test) guard in `data_dir()` protects
+# `cargo test`, not this.
+export HARMONIUM_DATA_DIR=/tmp/claude-1000/harmonium-data
 ./target/debug/harmonium &   # GPUI apps prefer Wayland automatically
 
 grim /tmp/claude-1000/shot.png        # screenshot (works, verified)

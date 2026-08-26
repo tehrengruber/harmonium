@@ -13,10 +13,9 @@ use std::path::PathBuf;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, App, AppContext as _, Context, Div, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    Stateful,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    div, px, App, AppContext as _, Context, Div, ElementId, Entity, EventEmitter, FocusHandle,
+    Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 
@@ -65,6 +64,70 @@ fn chip(id: impl Into<ElementId>, selected: bool) -> Stateful<Div> {
         .hover(|s| s.opacity(0.85))
 }
 
+/// How much of the window's height a dialog may cover. gpui-component drops
+/// its shell a tenth of the window down (`Dialog`'s default `margin_top`,
+/// dialog.rs:367), and this leaves about as much free underneath.
+const DIALOG_WINDOW_FRACTION: f32 = 0.8;
+
+/// What the shell adds around a dialog's own frame: 24px of padding above and
+/// below (`Edges::all(px(24.))`, dialog.rs:373), its 1px border, and a little
+/// slack. Subtracted here because the frame has to measure itself against the
+/// *window*: nothing between the two ever passes a height down. The shell's
+/// panel is a plain `v_flex` with no height and no maximum of its own
+/// (dialog.rs:423-475), and gpui's `AnyView` contributes no layout node at all
+/// — its `request_layout` returns the child's own layout id (view.rs:179) — so
+/// a view that renders taller than the window simply hangs off the bottom of
+/// it, which is exactly what the settings dialog used to do.
+const DIALOG_SHELL_CHROME: Pixels = px(56.);
+
+/// Smallest frame worth showing, for a window too short for the fraction
+/// above to leave anything usable.
+const MIN_DIALOG_HEIGHT: Pixels = px(160.);
+
+/// The height the dialog shell is capped at, applied where a dialog is
+/// presented. Each dialog's own [`dialog_frame`] already keeps itself below
+/// this, so the cap only ever catches a body that measured itself wrong —
+/// and then the shell's own scroll area takes over rather than the panel
+/// growing off the screen.
+pub fn max_shell_height(window: &Window) -> Pixels {
+    (window.viewport_size().height * DIALOG_WINDOW_FRACTION).max(MIN_DIALOG_HEIGHT)
+}
+
+/// A dialog's outer frame: a column no taller than the window can show, with
+/// the title above and the buttons below whatever [`dialog_body`] holds. The
+/// cap is what makes the body's `flex_1` mean something — an uncapped column
+/// grows to its content and nothing ever scrolls.
+fn dialog_frame(window: &Window) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .max_h((max_shell_height(window) - DIALOG_SHELL_CHROME).max(MIN_DIALOG_HEIGHT))
+}
+
+/// The scrolling middle of a dialog: everything that may grow without bound —
+/// a long task description, twenty presets, font size 24 — goes in here, so
+/// the title and the buttons around it stay put.
+///
+/// `flex_1` alone would not scroll: a flex child's automatic minimum height is
+/// its content, so it refuses to shrink below it however small the frame is.
+/// `min_h_0` is what allows the box to be shorter than what's in it, which is
+/// the point at which the overflow becomes scrollable.
+fn dialog_body(id: impl Into<ElementId>) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .gap_2()
+        .flex_1()
+        .min_h_0()
+        // Wrapping rows (chips) and inputs size themselves against this, and
+        // a child that refuses to shrink would scroll sideways instead.
+        .min_w_0()
+        .overflow_x_hidden()
+        .overflow_y_scroll()
+}
+
 /// The Cancel/submit pair at the foot of a dialog. The handlers emit the
 /// dialog's own events — what submitting *means* is the subscriber's business.
 fn dialog_buttons<V: 'static>(
@@ -77,6 +140,9 @@ fn dialog_buttons<V: 'static>(
         .flex()
         .gap_2()
         .justify_end()
+        // Tagged so a test can assert the buttons are still on screen when
+        // the body above them is far taller than the window.
+        .debug_selector(|| "dialog-buttons".into())
         .child(
             div()
                 .id("dialog-cancel")
@@ -182,17 +248,8 @@ impl NewAgentDialog {
 }
 
 impl Render for NewAgentDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut panel = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .text_color(theme::fg())
-                    .child("New agent — describe the task"),
-            )
-            .child(Input::new(&self.input));
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut panel = dialog_body("new-agent-body").child(Input::new(&self.input));
 
         // Preset selector.
         let mut chips = div().flex().flex_wrap().items_center().gap_1().child(
@@ -245,15 +302,26 @@ impl Render for NewAgentDialog {
             );
         }
 
+        // Title above, buttons below, the fields between them scrolling: the
+        // task field alone grows to twelve rows, and at a large font size
+        // that is more than a short window has.
+        let frame = dialog_frame(window)
+            .child(
+                div()
+                    .text_color(theme::fg())
+                    .child("New agent — describe the task"),
+            )
+            .child(panel);
+
         if self.planning {
-            panel.child(
+            frame.child(
                 div()
                     .text_color(theme::warn())
                     .text_sm()
                     .child("Planning workspace with LLM…"),
             )
         } else {
-            panel.child(dialog_buttons(
+            frame.child(dialog_buttons(
                 "Spawn",
                 cx,
                 |_, _, cx| cx.emit(NewAgentEvent::Cancel),
@@ -311,12 +379,8 @@ impl SearchDialog {
 }
 
 impl Render for SearchDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut panel = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(div().text_color(theme::fg()).child("Find in terminal"))
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut panel = dialog_body("search-body")
             .child(Input::new(&self.input))
             .child(
                 div()
@@ -367,31 +431,37 @@ impl Render for SearchDialog {
                 .hover(|s| s.opacity(0.9))
                 .child(label)
         };
-        panel.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_end()
-                .gap_2()
-                .child(
-                    div()
-                        .id("search-close")
-                        .px_3()
-                        .py_1()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .text_color(theme::fg_dim())
-                        .hover(|s| s.text_color(theme::fg()))
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SearchEvent::Close)))
-                        .child("Close"),
-                )
-                .child(button("search-prev", "Previous", false).on_click(cx.listener(
-                    |_, _, _, cx| cx.emit(SearchEvent::Search { forward: false }),
-                )))
-                .child(button("search-next", "Next", true).on_click(cx.listener(
-                    |_, _, _, cx| cx.emit(SearchEvent::Search { forward: true }),
-                ))),
-        )
+        dialog_frame(window)
+            .child(div().text_color(theme::fg()).child("Find in terminal"))
+            .child(panel)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    // Same tag as `dialog_buttons`: this dialog has three buttons
+                    // rather than two, but the row plays the same part.
+                    .debug_selector(|| "dialog-buttons".into())
+                    .child(
+                        div()
+                            .id("search-close")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(theme::fg_dim())
+                            .hover(|s| s.text_color(theme::fg()))
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(SearchEvent::Close)))
+                            .child("Close"),
+                    )
+                    .child(button("search-prev", "Previous", false).on_click(
+                        cx.listener(|_, _, _, cx| cx.emit(SearchEvent::Search { forward: false })),
+                    ))
+                    .child(button("search-next", "Next", true).on_click(
+                        cx.listener(|_, _, _, cx| cx.emit(SearchEvent::Search { forward: true })),
+                    )),
+            )
     }
 }
 
@@ -725,7 +795,7 @@ impl SettingsDialog {
 }
 
 impl Render for SettingsDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let section = |text: &'static str| {
             div().text_color(theme::fg()).text_sm().mt_2().child(text)
         };
@@ -807,27 +877,14 @@ impl Render for SettingsDialog {
 
         // Title and buttons stay fixed; everything in between scrolls, so
         // the dialog never outgrows the window.
-        div()
+        dialog_frame(window)
             // Focus target of last resort: with no preset rows there is no
             // input to hold the keyboard, and it would fall back to the
             // terminal behind the dialog.
             .track_focus(&self.focus_handle)
-            .flex()
-            .flex_col()
-            .gap_2()
-            .max_h_full()
             .child(div().text_color(theme::fg()).child("Settings"))
             .child(
-                div()
-                    .id("settings-body")
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .overflow_x_hidden()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
+                dialog_body("settings-body")
                     .child(self.render_font_size_row(cx))
                     .child(self.render_theme_row(cx))
                     .child(section("Fonts"))

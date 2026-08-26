@@ -2980,12 +2980,19 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let view = view.into();
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_dialog(cx, move |dialog, window, _cx| {
             dialog
                 .w(width)
                 // Never wider than the window; a long preset name used to
                 // push the buttons off the edge.
                 .max_w(px(920.))
+                // Nor taller than it: gpui-component's shell has no maximum
+                // height of its own, so without this the panel grows with its
+                // content until the buttons are off the bottom of the screen.
+                // Every dialog's frame already keeps itself under this cap
+                // (see `dialogs::dialog_frame`), which leaves this as the
+                // backstop — reached, the shell scrolls its own contents.
+                .max_h(crate::dialogs::max_shell_height(window))
                 .close_button(false)
                 .child(view.clone())
         });
@@ -3497,6 +3504,47 @@ mod tests {
         assert!(
             cx.update(|window, _| wanted.is_focused(window)),
             "the dialog took the keyboard off its own field"
+        );
+    }
+
+    /// A dialog with more in it than the window can show has to stay inside
+    /// the window: nothing above it constrains its height — gpui-component's
+    /// panel has no maximum of its own and an `AnyView` adds no layout node —
+    /// so before the frames were capped the settings panel simply grew with
+    /// its content until the buttons were off the bottom of the screen, with
+    /// no way to scroll to them.
+    #[gpui::test]
+    fn a_dialog_taller_than_the_window_keeps_its_buttons_on_screen(cx: &mut gpui::TestAppContext) {
+        let (workspace, cx) = test_window(cx);
+
+        // Far more presets than fit: each is a three-field card.
+        workspace.update(cx, |this, cx| {
+            this.state.settings.presets = (0..24)
+                .map(|i| PresetRecord {
+                    name: format!("preset-{i}"),
+                    command: "claude".into(),
+                    resume_command: None,
+                    env: String::new(),
+                })
+                .collect();
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.open_settings_dialog(window, cx);
+            })
+        });
+        cx.run_until_parked();
+
+        let window_height = cx.update(|window, _| window.viewport_size().height);
+        let buttons = cx
+            .debug_bounds("dialog-buttons")
+            .expect("the dialog's buttons were never drawn");
+        assert!(
+            buttons.bottom() <= window_height,
+            "the dialog's buttons sit {} past the bottom of a {} window",
+            buttons.bottom() - window_height,
+            window_height
         );
     }
 

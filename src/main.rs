@@ -1,4 +1,5 @@
 mod assets;
+mod dialogs;
 mod fatal;
 mod log;
 mod planner;

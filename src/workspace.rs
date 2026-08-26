@@ -1,5 +1,7 @@
-//! Root view: project/agent sidebar on the left, terminal pane on the right,
-//! modal dialogs for adding projects and spawning agents.
+//! Root view: project/agent sidebar on the left, terminal pane on the right.
+//! The modal dialogs are views of their own in [`crate::dialogs`]; this view
+//! opens them, draws gpui-component's dialog layer over itself, and reacts to
+//! the events they emit.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -9,72 +11,26 @@ use gpui::{
     div, px, svg, App, AppContext as _, Bounds, ClickEvent, Context, Div, ElementId, Entity,
     FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
     Point, Render, ScrollHandle, SharedString, Stateful, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, Window,
+    Styled as _, Subscription, Task, WeakEntity, Window,
 };
 
 use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use gpui_component::WindowExt as _;
+
+use crate::dialogs::{
+    NewAgentDialog, NewAgentEvent, SearchDialog, SearchEvent, SettingsDialog, SettingsEvent,
+    SettingsValues,
+};
 use crate::log;
 use crate::planner;
 use crate::state::{
     AgentGroup, AgentId, AgentRecord, AppState, PendingAgentMove, PresetRecord, ProjectRecord,
-    SaveError, StateFile, TerminalTabRecord, WorkspaceMode,
+    SaveError, StateFile, TerminalTabRecord,
 };
 use crate::state;
 use crate::terminal::view::TerminalView;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::theme;
-
-struct PresetInputs {
-    name: Entity<InputState>,
-    command: Entity<InputState>,
-    env: Entity<InputState>,
-}
-
-enum Dialog {
-    NewAgent {
-        project_path: PathBuf,
-        /// Group the new agent lands in, when the spawn was started from a
-        /// group header rather than the project row.
-        group: Option<String>,
-        input: Entity<InputState>,
-        planning: bool,
-        preset: usize,
-        workspace_mode: WorkspaceMode,
-        error: Option<String>,
-        _subscription: Subscription,
-    },
-    /// Search the visible terminal's scrollback. Matches are shown by
-    /// selecting them, so the dialog stays out of the way of the terminal
-    /// itself and the usual copy shortcut works on whatever it found.
-    Search {
-        input: Entity<InputState>,
-        match_case: bool,
-        wrap: bool,
-        /// Result of the last search — "no matches", "wrapped", …
-        status: Option<String>,
-        _subscription: Subscription,
-    },
-    Settings {
-        /// Focus target for the panel itself, so the modal always owns the
-        /// keyboard even when it has no input to focus (no presets yet).
-        focus_handle: FocusHandle,
-        planner_command: Entity<InputState>,
-        planner_model: Entity<InputState>,
-        terminal_font: Entity<InputState>,
-        ui_font: Entity<InputState>,
-        preset_inputs: Vec<PresetInputs>,
-        /// Which preset row the planner should run through, as an index into
-        /// `preset_inputs` so a rename in the same visit still points at the
-        /// row the user picked. `None` is the built-in `claude -p`.
-        planner_preset_row: Option<usize>,
-        _subscriptions: Vec<Subscription>,
-    },
-}
-
-/// Rows the task field grows to before it scrolls instead. Without a cap a
-/// long description pushes the Spawn button off the bottom of the window.
-const MAX_TASK_ROWS: usize = 12;
 
 const MIN_SIDEBAR_WIDTH: f32 = 180.;
 const MAX_SIDEBAR_WIDTH: f32 = 600.;
@@ -203,7 +159,12 @@ pub struct Workspace {
     /// Restoration is lazy: nothing is spawned until an agent is selected.
     restored: HashSet<AgentId>,
     selected: Option<AgentId>,
-    dialog: Option<Dialog>,
+    /// The open search dialog, if any — held weakly for the reopen path:
+    /// ctrl-shift-f while it is already up must reuse it, not stack a second
+    /// panel. Not a record of openness — gpui-component's dialog layer holds
+    /// the only strong handle, so this upgrades exactly as long as that layer
+    /// shows the dialog, and nothing has to remember to clear it.
+    search_dialog: Option<WeakEntity<SearchDialog>>,
     inline_edit: Option<InlineEdit>,
     resizing_sidebar: bool,
     status: Option<(String, bool)>,
@@ -245,7 +206,7 @@ impl Workspace {
             outgoing_terminals: HashMap::new(),
             restored: HashSet::new(),
             selected: None,
-            dialog: None,
+            search_dialog: None,
             inline_edit: None,
             resizing_sidebar: false,
             status: None,
@@ -942,219 +903,59 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Describe the task… (ctrl-enter to spawn)")
-                .multi_line(true)
-                .auto_grow(1, MAX_TASK_ROWS)
-        });
-        let path = project_path.clone();
-        let subscription = cx.subscribe_in(
-            &input,
-            window,
-            move |this, input, event: &InputEvent, window, cx| {
-                // Multi-line: plain enter inserts a newline, the secondary
-                // chord (ctrl-enter here) spawns. Escape is handled by the
-                // dialog overlay, which owns it for every dialog.
-                if let InputEvent::PressEnter { secondary: true } = event {
-                    let task = input.read(cx).value().trim().to_string();
-                    if !task.is_empty() {
-                        this.spawn_agent(path.clone(), task, window, cx);
-                    }
-                }
-            },
-        );
-        let focus = input.focus_handle(cx);
-        let preset = self
-            .state
-            .settings
-            .last_preset
-            .min(self.state.settings.presets.len().saturating_sub(1));
-        self.dialog = Some(Dialog::NewAgent {
-            project_path,
-            group,
-            input,
-            planning: false,
-            preset,
-            // Always Auto, never the last choice: forcing a workspace is a
-            // decision about *one* task, and inheriting it silently would put
-            // the next task somewhere it wasn't meant to go.
-            workspace_mode: WorkspaceMode::Auto,
-            error: None,
-            _subscription: subscription,
-        });
+        let dialog = cx
+            .new(|cx| NewAgentDialog::new(project_path, group, &self.state.settings, window, cx));
+        // Detached rather than stored: the subscription lives no longer than
+        // the dialog entity, which the dialog layer drops on close.
+        cx.subscribe_in(&dialog, window, |this, dialog, event, window, cx| match event {
+            NewAgentEvent::Spawn => this.spawn_agent(dialog, window, cx),
+            NewAgentEvent::Cancel => this.close_dialog(window, cx),
+        })
+        .detach();
+        let focus = dialog.read(cx).first_focus(cx);
+        self.present_dialog(dialog, px(560.), window, cx);
         // After presenting, never before: opening the dialog layer focuses
         // the dialog itself, which would take the keyboard off the field.
-        self.present_dialog(px(560.), window, cx);
         window.focus(&focus);
     }
 
     // ---- Settings ----
 
-    /// One text field in the settings dialog, wired to the same save/cancel
-    /// handling as the preset fields.
-    fn make_setting_input(
+    fn open_settings_dialog(
         &mut self,
-        placeholder: &'static str,
-        value: &str,
-        subscriptions: &mut Vec<Subscription>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Entity<InputState> {
-        let value = value.to_string();
-        let input = cx.new(|cx| {
-            let mut state = InputState::new(window, cx).placeholder(placeholder);
-            if !value.is_empty() {
-                state.set_value(value, window, cx);
+    ) -> Entity<SettingsDialog> {
+        let dialog = cx.new(|cx| SettingsDialog::new(&self.state.settings, window, cx));
+        cx.subscribe_in(&dialog, window, |this, dialog, event, window, cx| match event {
+            SettingsEvent::Save => {
+                let values = dialog.read(cx).values(cx);
+                this.save_settings(values, window, cx);
             }
-            state
-        });
-        subscriptions.push(cx.subscribe_in(
-            &input,
-            window,
-            |this, _input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.save_settings(window, cx);
-                }
-            },
-        ));
-        input
-    }
-
-    fn make_preset_inputs(
-        &mut self,
-        preset: &PresetRecord,
-        subscriptions: &mut Vec<Subscription>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> PresetInputs {
-        let mut make = |placeholder: &'static str, value: &str| {
-            let value = value.to_string();
-            let input = cx.new(|cx| {
-                let mut state = InputState::new(window, cx).placeholder(placeholder);
-                if !value.is_empty() {
-                    state.set_value(value, window, cx);
-                }
-                state
-            });
-            // `subscribe_in` rather than `subscribe`: closing the dialog has
-            // to hand the keyboard back to the terminal, which needs a window.
-            subscriptions.push(cx.subscribe_in(
-                &input,
-                window,
-                |this, _input, event: &InputEvent, window, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
-                        this.save_settings(window, cx);
-                    }
-                },
-            ));
-            input
-        };
-        PresetInputs {
-            name: make("Preset name", &preset.name),
-            command: make("Command (task, --continue or planner flags appended)", &preset.command),
-            env: make("KEY=value KEY2=value2", &preset.env),
-        }
-    }
-
-    fn open_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let presets = self.state.settings.presets.clone();
-        let mut subscriptions = Vec::new();
-        let preset_inputs: Vec<PresetInputs> = presets
-            .iter()
-            .map(|p| self.make_preset_inputs(p, &mut subscriptions, window, cx))
-            .collect();
+            SettingsEvent::Cancel => this.close_dialog(window, cx),
+            // Font size and theme apply immediately, not on save: the state
+            // they change is the workspace's (and the theme globals'), which
+            // is why the dialog only asks for the change.
+            SettingsEvent::AdjustFontSize(delta) => this.set_font_size(*delta, cx),
+            SettingsEvent::SetTheme(mode) => this.set_theme(*mode, cx),
+        })
+        .detach();
         // The dialog is modal, so it has to take the keyboard: without this
         // the terminal keeps focus and typing goes into the PTY behind the
-        // dialog. Prefer the first field; fall back to the panel itself when
-        // there are no presets to focus.
-        let settings = self.state.settings.clone();
-        let planner_command = self.make_setting_input(
-            "Full command; leave empty to use the model below",
-            &settings.planner_command,
-            &mut subscriptions,
-            window,
-            cx,
-        );
-        let planner_model = self.make_setting_input(
-            planner::DEFAULT_MODEL,
-            &settings.planner_model,
-            &mut subscriptions,
-            window,
-            cx,
-        );
-        let terminal_font = self.make_setting_input(
-            theme::DEFAULT_TERMINAL_FONT,
-            &settings.terminal_font,
-            &mut subscriptions,
-            window,
-            cx,
-        );
-        let ui_font = self.make_setting_input(
-            theme::DEFAULT_UI_FONT,
-            &settings.ui_font,
-            &mut subscriptions,
-            window,
-            cx,
-        );
-        let focus_handle = cx.focus_handle();
-        let focus = match preset_inputs.first() {
-            Some(first) => first.name.focus_handle(cx),
-            None => focus_handle.clone(),
-        };
-        let planner_preset_row = self.state.settings.planner_preset.as_deref().and_then(|name| {
-            self.state
-                .settings
-                .presets
-                .iter()
-                .position(|preset| preset.name == name)
-        });
-        self.dialog = Some(Dialog::Settings {
-            focus_handle,
-            planner_command,
-            planner_model,
-            terminal_font,
-            ui_font,
-            preset_inputs,
-            planner_preset_row,
-            _subscriptions: subscriptions,
-        });
-        self.present_dialog(px(620.), window, cx);
+        // dialog.
+        let focus = dialog.read(cx).first_focus(cx);
+        self.present_dialog(dialog.clone(), px(620.), window, cx);
         window.focus(&focus);
-    }
-
-    fn add_preset_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut subscriptions = Vec::new();
-        let inputs =
-            self.make_preset_inputs(&PresetRecord::default(), &mut subscriptions, window, cx);
-        // Typing should land in the row that was just added.
-        window.focus(&inputs.name.focus_handle(cx));
-        if let Some(Dialog::Settings {
-            preset_inputs,
-            _subscriptions,
-            ..
-        }) = &mut self.dialog
-        {
-            preset_inputs.push(inputs);
-            _subscriptions.extend(subscriptions);
-        }
-        cx.notify();
-    }
-
-    fn remove_preset_row(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(Dialog::Settings { preset_inputs, .. }) = &mut self.dialog {
-            if index < preset_inputs.len() {
-                preset_inputs.remove(index);
-            }
-        }
-        cx.notify();
+        // Handed back for the focus test; every in-app caller drops it.
+        dialog
     }
 
     /// Dismiss the open dialog and hand the keyboard back to the selected
     /// agent's terminal — otherwise focus dies with the dialog's inputs and
-    /// typing goes nowhere until the terminal is clicked.
+    /// typing goes nowhere until the terminal is clicked. Escape and the
+    /// backdrop never come through here: the dialog layer closes itself and
+    /// restores the focus it took when it opened.
     fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dialog = None;
         window.close_dialog(cx);
         if let Some(id) = self.selected.clone() {
             if let Some(view) = self.active_terminal(&id) {
@@ -1165,47 +966,20 @@ impl Workspace {
         cx.notify();
     }
 
-    fn save_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Dialog::Settings {
+    fn save_settings(
+        &mut self,
+        values: SettingsValues,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let SettingsValues {
             planner_command,
             planner_model,
             terminal_font,
             ui_font,
-            preset_inputs,
-            planner_preset_row,
-            ..
-        }) = &self.dialog
-        else {
-            return;
-        };
-        let planner_preset_row = *planner_preset_row;
-        let text = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
-        let planner_command = text(planner_command);
-        let planner_model = text(planner_model);
-        let terminal_font = text(terminal_font);
-        let ui_font = text(ui_font);
-        let mut presets: Vec<crate::state::PresetRecord> = Vec::new();
-        // Follow the planner's row through: empty rows are dropped here, so
-        // the saved name has to be looked up while the mapping is still known.
-        let mut planner_preset = None;
-        for (row, inputs) in preset_inputs.iter().enumerate() {
-            let name = inputs.name.read(cx).value().trim().to_string();
-            let command = inputs.command.read(cx).value().trim().to_string();
-            let env = inputs.env.read(cx).value().trim().to_string();
-            if name.is_empty() && command.is_empty() {
-                continue;
-            }
-            let name = if name.is_empty() { command.clone() } else { name };
-            if planner_preset_row == Some(row) {
-                planner_preset = Some(name.clone());
-            }
-            presets.push(crate::state::PresetRecord {
-                name,
-                command,
-                resume_command: None,
-                env,
-            });
-        }
+            presets,
+            planner_preset,
+        } = values;
         self.state.settings.presets = presets;
         self.state.settings.planner_preset = planner_preset;
         self.state.settings.last_preset = self
@@ -1238,36 +1012,31 @@ impl Workspace {
 
     fn spawn_agent(
         &mut self,
-        project_path: PathBuf,
-        task: String,
+        dialog: &Entity<NewAgentDialog>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let preset_index;
-        let workspace_mode;
-        let group;
-        if let Some(Dialog::NewAgent {
-            planning,
-            preset,
-            workspace_mode: mode,
-            group: into_group,
-            error,
-            ..
-        }) = &mut self.dialog
-        {
-            if *planning {
+        let (project_path, task, group, preset_index, workspace_mode) = {
+            let dialog = dialog.read(cx);
+            if dialog.planning {
                 return;
             }
-            *planning = true;
-            *error = None;
-            preset_index = *preset;
-            workspace_mode = *mode;
-            group = into_group.clone();
-        } else {
-            preset_index = self.state.settings.last_preset;
-            workspace_mode = WorkspaceMode::Auto;
-            group = None;
+            (
+                dialog.project_path.clone(),
+                dialog.task(cx),
+                dialog.group.clone(),
+                dialog.preset,
+                dialog.workspace_mode,
+            )
+        };
+        if task.is_empty() {
+            return;
         }
+        dialog.update(cx, |dialog, cx| {
+            dialog.planning = true;
+            dialog.error = None;
+            cx.notify();
+        });
         let preset = self
             .state
             .settings
@@ -1286,6 +1055,10 @@ impl Workspace {
 
         let repo = project_path.clone();
         let planner_settings = self.planner_settings(&project_path);
+        // Weak: escape may close the dialog while the planner runs, and a
+        // dead handle is how the completion learns the error has nowhere to
+        // go but the status line.
+        let dialog = dialog.downgrade();
         cx.spawn_in(window, async move |this, cx| {
             let repo_for_bg = repo.clone();
             let task_for_bg = task.clone();
@@ -1340,10 +1113,6 @@ impl Workspace {
                 };
                 match outcome {
                     Ok(workspace) => {
-                        // Dismiss the dialog layer too, not just our state:
-                        // the panel lives in Root now, so dropping the state
-                        // alone would leave it on screen.
-                        this.dialog = None;
                         window.close_dialog(cx);
                         this.finish_spawn(repo, group, task, workspace, preset, window, cx);
                     }
@@ -1351,14 +1120,13 @@ impl Workspace {
                         // Keep the dialog open so the task text isn't lost;
                         // show the error inline for a retry.
                         log::error(message.clone());
-                        if let Some(Dialog::NewAgent {
-                            planning, error, ..
-                        }) = &mut this.dialog
-                        {
-                            *planning = false;
-                            *error = Some(message);
-                        } else {
-                            this.set_status(message, true, cx);
+                        match dialog.upgrade() {
+                            Some(dialog) => dialog.update(cx, |dialog, cx| {
+                                dialog.planning = false;
+                                dialog.error = Some(message);
+                                cx.notify();
+                            }),
+                            None => this.set_status(message, true, cx),
                         }
                     }
                 }
@@ -1520,55 +1288,50 @@ impl Workspace {
             return;
         }
         // Reopening keeps the previous query and options; only the focus and
-        // the stale result line are reset.
-        if let Some(Dialog::Search { input, status, .. }) = &mut self.dialog {
-            *status = None;
-            let input = input.clone();
+        // the stale result line are reset. The weak handle upgrades only
+        // while the dialog layer still shows the dialog, so this can't
+        // stack a second panel.
+        if let Some(dialog) = self.search_dialog.as_ref().and_then(|dialog| dialog.upgrade()) {
+            dialog.update(cx, |dialog, cx| {
+                dialog.status = None;
+                cx.notify();
+            });
             // Select the old query so the next keystroke replaces it.
-            window.focus(&input.focus_handle(cx));
+            window.focus(&dialog.read(cx).first_focus(cx));
             window.dispatch_action(Box::new(SelectAll), cx);
             cx.notify();
             return;
         }
-        let input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Find in terminal…"));
-        let subscription = cx.subscribe_in(
-            &input,
-            window,
-            move |this, _input, event: &InputEvent, _window, cx| match event {
-                // Enter walks forward through the matches.
-                InputEvent::PressEnter { .. } => this.find_in_terminal(true, cx),
-                _ => {}
-            },
-        );
-        let focus = input.focus_handle(cx);
-        self.dialog = Some(Dialog::Search {
-            input,
-            match_case: false,
-            wrap: true,
-            status: None,
-            _subscription: subscription,
-        });
-        self.present_dialog(px(460.), window, cx);
+        let dialog = cx.new(|cx| SearchDialog::new(window, cx));
+        self.search_dialog = Some(dialog.downgrade());
+        cx.subscribe_in(&dialog, window, |this, dialog, event, window, cx| match event {
+            SearchEvent::Search { forward } => this.find_in_terminal(dialog, *forward, cx),
+            SearchEvent::Close => this.close_dialog(window, cx),
+        })
+        .detach();
+        let focus = dialog.read(cx).first_focus(cx);
+        self.present_dialog(dialog, px(460.), window, cx);
         window.focus(&focus);
     }
 
-    /// Run one search step against the terminal the user is looking at.
-    fn find_in_terminal(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let Some(Dialog::Search {
-            input,
-            match_case,
-            wrap,
-            ..
-        }) = &self.dialog
-        else {
-            return;
-        };
-        let query = input.read(cx).value().to_string();
-        let options = crate::terminal::SearchOptions {
-            forward,
-            match_case: *match_case,
-            wrap: *wrap,
+    /// Run one search step against the terminal the user is looking at, and
+    /// write the result line back into the dialog.
+    fn find_in_terminal(
+        &mut self,
+        dialog: &Entity<SearchDialog>,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let (query, options) = {
+            let dialog = dialog.read(cx);
+            (
+                dialog.input.read(cx).value().to_string(),
+                crate::terminal::SearchOptions {
+                    forward,
+                    match_case: dialog.match_case,
+                    wrap: dialog.wrap,
+                },
+            )
         };
         let Some(view) = self
             .selected
@@ -1602,10 +1365,10 @@ impl Workspace {
             ),
             Err(error) => Some(format!("{error:#}")),
         };
-        if let Some(Dialog::Search { status, .. }) = &mut self.dialog {
-            *status = message;
-        }
-        cx.notify();
+        dialog.update(cx, |dialog, cx| {
+            dialog.status = message;
+            cx.notify();
+        });
     }
 
     /// Spawn a fresh shell in the agent's workdir for a new terminal tab.
@@ -3204,692 +2967,31 @@ impl Workspace {
         pane
     }
 
-    fn dialog_buttons(&self, submit_label: &'static str, cx: &Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .gap_2()
-            .justify_end()
-            .child(
-                div()
-                    .id("dialog-cancel")
-                    .px_3()
-                    .py_1()
-                    .rounded_sm()
-                    .text_color(theme::fg_dim())
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme::hover_bg()))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.close_dialog(window, cx);
-                    }))
-                    .child("Cancel"),
-            )
-            .child(
-                div()
-                    .id("dialog-submit")
-                    .px_3()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(theme::accent())
-                    .text_color(theme::panel_bg())
-                    .cursor_pointer()
-                    .hover(|s| s.opacity(0.9))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.submit_dialog(window, cx);
-                    }))
-                    .child(submit_label),
-            )
-    }
-
-    fn render_font_size_row(&self, cx: &Context<Self>) -> impl IntoElement {
-        let base = theme::base_font_size(cx);
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .text_color(theme::fg_dim())
-                    .text_sm()
-                    .child("Base font size"),
-            )
-            .child(
-                div()
-                    .id("font-size-dec")
-                    .px_2()
-                    .rounded_sm()
-                    .bg(theme::selected_bg())
-                    .text_color(theme::fg())
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme::hover_bg()))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.set_font_size(-1., cx);
-                    }))
-                    .child("-"),
-            )
-            .child(
-                div()
-                    .w_8()
-                    .text_center()
-                    .text_color(theme::fg())
-                    .child(SharedString::from(format!("{base:.0}"))),
-            )
-            .child(
-                div()
-                    .id("font-size-inc")
-                    .px_2()
-                    .rounded_sm()
-                    .bg(theme::selected_bg())
-                    .text_color(theme::fg())
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme::hover_bg()))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.set_font_size(1., cx);
-                    }))
-                    .child("+"),
-            )
-    }
-
-    /// Picks which agent preset the planner runs through. Reads the preset
-    /// *rows* rather than the saved list, so a name edited in this same visit
-    /// is what you choose from.
-    fn render_planner_preset_row(
-        &self,
-        preset_inputs: &[PresetInputs],
-        selected: Option<usize>,
-        cx: &Context<Self>,
-    ) -> gpui::AnyElement {
-        let chip = |label: SharedString, row: Option<usize>, cx: &Context<Self>| {
-            let is_selected = row == selected;
-            div()
-                .id(("planner-preset", row.map(|r| r + 1).unwrap_or(0)))
-                .px_2()
-                .py_0p5()
-                .rounded_sm()
-                .text_sm()
-                .cursor_pointer()
-                .bg(if is_selected {
-                    theme::accent()
-                } else {
-                    theme::selected_bg()
-                })
-                .text_color(if is_selected {
-                    theme::panel_bg()
-                } else {
-                    theme::fg()
-                })
-                .hover(|s| s.opacity(0.85))
-                // A long preset name must not widen the dialog past the
-                // window: the chip is capped and its label ellipsized.
-                .max_w_full()
-                .truncate()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(Dialog::Settings {
-                        planner_preset_row, ..
-                    }) = &mut this.dialog
-                    {
-                        *planner_preset_row = row;
-                    }
-                    cx.notify();
-                }))
-                .child(label)
-        };
-        let mut row = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .w_24()
-                    .flex_none()
-                    .text_color(theme::fg_dim())
-                    .child("Preset"),
-            )
-            .child(chip("Default (claude)".into(), None, cx));
-        for (index, inputs) in preset_inputs.iter().enumerate() {
-            let name = inputs.name.read(cx).value().trim().to_string();
-            let command = inputs.command.read(cx).value().trim().to_string();
-            if name.is_empty() && command.is_empty() {
-                continue;
-            }
-            let label = if name.is_empty() { command } else { name };
-            row = row.child(chip(ellipsize(&label, CHIP_LABEL_CHARS).into(), Some(index), cx));
-        }
-        row.into_any_element()
-    }
-
-    fn render_theme_row(&self, cx: &Context<Self>) -> impl IntoElement {
-        let current = theme::mode();
-        let chip = |label: &'static str,
-                    mode: theme::ThemeMode,
-                    cx: &Context<Self>| {
-            let selected = current == mode;
-            div()
-                .id(label)
-                .px_2()
-                .py_0p5()
-                .rounded_sm()
-                .text_sm()
-                .cursor_pointer()
-                .bg(if selected {
-                    theme::accent()
-                } else {
-                    theme::selected_bg()
-                })
-                .text_color(if selected {
-                    theme::panel_bg()
-                } else {
-                    theme::fg()
-                })
-                .hover(|s| s.opacity(0.85))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_theme(mode, cx);
-                }))
-                .child(label)
-        };
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(div().text_color(theme::fg_dim()).text_sm().child("Theme"))
-            .child(chip("Light", theme::ThemeMode::Light, cx))
-            .child(chip("Dark", theme::ThemeMode::Dark, cx))
-    }
-
-    /// The body of the open dialog. The surface around it — backdrop,
-    /// panel, escape and the focus trap — belongs to gpui-component's
-    /// dialog layer, which re-runs this on every frame, so the content can
-    /// read live state (planning in progress, an error, a chip selection).
-    fn render_dialog_content(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
-        let dialog = self.dialog.as_ref()?;
-
-        let panel = match dialog {
-            Dialog::NewAgent {
-                input,
-                planning,
-                preset,
-                workspace_mode,
-                error,
-                ..
-            } => {
-                let mut panel = div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_color(theme::fg())
-                            .child("New agent — describe the task"),
-                    )
-                    .child(Input::new(&input));
-
-                // Preset selector.
-                let selected = *preset;
-                let mut chips = div().flex().flex_wrap().items_center().gap_1().child(
-                    div()
-                        .text_color(theme::fg_dim())
-                        .text_sm()
-                        .child("Preset:"),
-                );
-                for (index, preset_record) in self.state.settings.presets.iter().enumerate() {
-                    let is_selected = index == selected;
-                    chips = chips.child(
-                        div()
-                            .id(("preset-chip", index))
-                            .px_2()
-                            .py_0p5()
-                            .rounded_sm()
-                            .text_sm()
-                            .cursor_pointer()
-                            .bg(if is_selected {
-                                theme::accent()
-                            } else {
-                                theme::selected_bg()
-                            })
-                            .text_color(if is_selected {
-                                theme::panel_bg()
-                            } else {
-                                theme::fg()
-                            })
-                            .hover(|s| s.opacity(0.85))
-                            // Long preset names must not widen the dialog.
-                            .max_w_full()
-                            .truncate()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(Dialog::NewAgent { preset, .. }) = &mut this.dialog {
-                                    *preset = index;
-                                }
-                                cx.notify();
-                            }))
-                            .child(SharedString::from(ellipsize(
-                                &preset_record.name,
-                                CHIP_LABEL_CHARS,
-                            ))),
-                    );
-                }
-                panel = panel.child(chips);
-
-                // Workspace selector. The task description still names the
-                // agent in every mode; this only picks where it works.
-                let selected_mode = *workspace_mode;
-                let mut modes = div().flex().flex_wrap().items_center().gap_1().child(
-                    div()
-                        .text_color(theme::fg_dim())
-                        .text_sm()
-                        .child("Workspace:"),
-                );
-                for (index, mode) in WorkspaceMode::ALL.into_iter().enumerate() {
-                    let is_selected = mode == selected_mode;
-                    modes = modes.child(
-                        div()
-                            .id(("workspace-mode-chip", index))
-                            .px_2()
-                            .py_0p5()
-                            .rounded_sm()
-                            .text_sm()
-                            .cursor_pointer()
-                            .bg(if is_selected {
-                                theme::accent()
-                            } else {
-                                theme::selected_bg()
-                            })
-                            .text_color(if is_selected {
-                                theme::panel_bg()
-                            } else {
-                                theme::fg()
-                            })
-                            .hover(|s| s.opacity(0.85))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(Dialog::NewAgent { workspace_mode, .. }) =
-                                    &mut this.dialog
-                                {
-                                    *workspace_mode = mode;
-                                }
-                                cx.notify();
-                            }))
-                            .child(mode.label()),
-                    );
-                }
-                panel = panel.child(modes);
-
-                if let Some(error) = error {
-                    panel = panel.child(
-                        div()
-                            .text_color(theme::error())
-                            .text_sm()
-                            .child(SharedString::from(error.clone())),
-                    );
-                }
-
-                if *planning {
-                    panel.child(
-                        div()
-                            .text_color(theme::warn())
-                            .text_sm()
-                            .child("Planning workspace with LLM…"),
-                    )
-                } else {
-                    panel.child(self.dialog_buttons("Spawn", cx))
-                }
-                .into_any_element()
-            }
-
-            Dialog::Search {
-                input,
-                match_case,
-                wrap,
-                status,
-                ..
-            } => {
-                // One toggle chip, styled like the preset/workspace chips.
-                let toggle = |id: &'static str, label: &'static str, on: bool| {
-                    div()
-                        .id(id)
-                        .px_2()
-                        .py_0p5()
-                        .rounded_sm()
-                        .text_sm()
-                        .cursor_pointer()
-                        .bg(if on {
-                            theme::accent()
-                        } else {
-                            theme::selected_bg()
-                        })
-                        .text_color(if on { theme::panel_bg() } else { theme::fg() })
-                        .hover(|s| s.opacity(0.85))
-                        .child(label)
-                };
-                let mut panel = div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(div().text_color(theme::fg()).child("Find in terminal"))
-                    .child(Input::new(&input))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                toggle("search-match-case", "Match case", *match_case).on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        if let Some(Dialog::Search { match_case, .. }) =
-                                            &mut this.dialog
-                                        {
-                                            *match_case = !*match_case;
-                                        }
-                                        cx.notify();
-                                    }),
-                                ),
-                            )
-                            .child(
-                                toggle("search-wrap", "Wrap around", *wrap).on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        if let Some(Dialog::Search { wrap, .. }) = &mut this.dialog {
-                                            *wrap = !*wrap;
-                                        }
-                                        cx.notify();
-                                    },
-                                )),
-                            ),
-                    );
-
-                if let Some(status) = status {
-                    panel = panel.child(
-                        div()
-                            .text_color(theme::fg_dim())
-                            .text_sm()
-                            .child(SharedString::from(status.clone())),
-                    );
-                }
-
-                let button = |id: &'static str, label: &'static str, primary: bool| {
-                    div()
-                        .id(id)
-                        .px_3()
-                        .py_1()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .bg(if primary {
-                            theme::accent()
-                        } else {
-                            theme::selected_bg()
-                        })
-                        .text_color(if primary { theme::panel_bg() } else { theme::fg() })
-                        .hover(|s| s.opacity(0.9))
-                        .child(label)
-                };
-                panel
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("search-close")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .text_color(theme::fg_dim())
-                                    .hover(|s| s.text_color(theme::fg()))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.close_dialog(window, cx);
-                                    }))
-                                    .child("Close"),
-                            )
-                            .child(button("search-prev", "Previous", false).on_click(
-                                cx.listener(|this, _, _, cx| this.find_in_terminal(false, cx)),
-                            ))
-                            .child(button("search-next", "Next", true).on_click(cx.listener(
-                                |this, _, _, cx| this.find_in_terminal(true, cx),
-                            ))),
-                    )
-                    .into_any_element()
-            }
-
-            Dialog::Settings {
-                focus_handle,
-                planner_command,
-                planner_model,
-                terminal_font,
-                ui_font,
-                preset_inputs,
-                planner_preset_row,
-                ..
-            } => {
-                let section = |text: &'static str| {
-                    div()
-                        .text_color(theme::fg())
-                        .text_sm()
-                        .mt_2()
-                        .child(text)
-                };
-                let field = |text: &'static str, input: Entity<InputState>| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .w_24()
-                                .flex_none()
-                                .text_color(theme::fg_dim())
-                                .text_xs()
-                                .child(text),
-                        )
-                        .child(div().flex_1().min_w_0().child(Input::new(&input)))
-                };
-                let mut preset_list = div().flex().flex_col().gap_2();
-                for (index, inputs) in preset_inputs.iter().enumerate() {
-                    let label = |text: &'static str| {
-                        div()
-                            .w_24()
-                            .flex_none()
-                            .text_color(theme::fg_dim())
-                            .text_xs()
-                            .child(text)
-                    };
-                    preset_list = preset_list.child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .p_2()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(theme::border())
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(label("Name"))
-                                    .child(div().flex_1().min_w_0().child(Input::new(&inputs.name)))
-                                    .child(
-                                        div()
-                                            .id(("preset-remove", index))
-                                            .px_1()
-                                            .rounded_sm()
-                                            .text_color(theme::fg_dim())
-                                            .cursor_pointer()
-                                            .hover(|s| {
-                                                s.bg(theme::selected_bg())
-                                                    .text_color(theme::error())
-                                            })
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.remove_preset_row(index, cx);
-                                            }))
-                                            .child("×"),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(label("Command"))
-                                    .child(div().flex_1().min_w_0().child(Input::new(&inputs.command))),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(label("Env"))
-                                    .child(div().flex_1().min_w_0().child(Input::new(&inputs.env))),
-                            ),
-                    );
-                }
-
-                // Title and buttons stay fixed; everything in between
-                // scrolls, so the dialog never outgrows the window.
-                div()
-                    // Focus target of last resort: with no preset rows there
-                    // is no input to hold the keyboard, and it would fall
-                    // back to the terminal behind the dialog.
-                    .track_focus(focus_handle)
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .max_h_full()
-                    .child(div().text_color(theme::fg()).child("Settings"))
-                    .child(
-                        div()
-                            .id("settings-body")
-                            .flex_1()
-                            .min_h_0()
-                            .min_w_0()
-                            .overflow_x_hidden()
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(self.render_font_size_row(cx))
-                            .child(self.render_theme_row(cx))
-                            .child(section("Fonts"))
-                            .child(field("Terminal", terminal_font.clone()))
-                            .child(field("UI", ui_font.clone()))
-                            .child(section("Planner"))
-                            .child(
-                                div()
-                                    .text_color(theme::fg_dim())
-                                    .text_xs()
-                                    .child("Derives the branch and agent name from the task description."),
-                            )
-                            .child(self.render_planner_preset_row(
-                                preset_inputs,
-                                *planner_preset_row,
-                                cx,
-                            ))
-                            .child(field("Command", planner_command.clone()))
-                            .child(field("Model", planner_model.clone()))
-                            .when(
-                                !planner_command.read(cx).value().trim().is_empty(),
-                                |panel| {
-                                    panel.child(
-                                        div()
-                                            .pl_24()
-                                            .text_color(theme::fg_dim())
-                                            .text_xs()
-                                            .child("The model is unused while a command is set."),
-                                    )
-                                },
-                            )
-                            .child(
-                                div()
-                                    .text_color(theme::fg())
-                                    .text_sm()
-                                    .mt_2()
-                                    .child("Agent presets"),
-                            )
-                            .child(
-                                div()
-                                    .text_color(theme::fg_dim())
-                                    .text_xs()
-                                    .child("The task description is appended to the command. Env holds KEY=value words given to the agent, its resumes and its shell tabs. Use claude-isol for sandboxed runs (github.com/tehrengruber/claude-container-isolation)."),
-                            )
-                            .child(preset_list)
-                            .child(
-                                div()
-                                    .id("preset-add")
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_sm()
-                                    .text_color(theme::accent())
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme::hover_bg()))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.add_preset_row(window, cx);
-                                    }))
-                                    .child("+ Add preset"),
-                            ),
-                    )
-                    .child(self.dialog_buttons("Save", cx))
-                    .into_any_element()
-            }
-        };
-
-        Some(panel)
-    }
-
-    /// Hand the open dialog to the dialog layer. `Root` owns the backdrop,
-    /// the focus trap and escape from here on; closing it there has to clear
-    /// our own `dialog` state, hence the `on_close` hook.
-    fn present_dialog(&mut self, width: gpui::Pixels, window: &mut Window, cx: &mut Context<Self>) {
-        let this = cx.entity();
-        window.open_dialog(cx, move |dialog, _window, cx| {
-            // `update` rather than `read`: the content wires up listeners,
-            // which need our own context.
-            let content = this.update(cx, |this, cx| this.render_dialog_content(cx));
-            let dialog = dialog
+    /// Hand a dialog view to gpui-component's dialog layer. From here on
+    /// the layer owns everything about the dialog: the backdrop, the focus
+    /// trap, escape — and, deliberately, the only record that it is open at
+    /// all (its builder keeps the view alive). The builder just wraps the
+    /// view, so re-running it every frame touches nothing of ours.
+    fn present_dialog(
+        &mut self,
+        view: impl Into<gpui::AnyView>,
+        width: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = view.into();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            dialog
                 .w(width)
                 // Never wider than the window; a long preset name used to
                 // push the buttons off the edge.
                 .max_w(px(920.))
                 .close_button(false)
-                .on_close({
-                    let this = this.clone();
-                    // Escape, the backdrop and the close button all end here,
-                    // so this is where our own dialog state is cleared.
-                    move |_, _window, cx| {
-                        this.update(cx, |this, cx| {
-                            this.dialog = None;
-                            cx.notify();
-                        });
-                    }
-                });
-            match content {
-                Some(content) => dialog.child(content),
-                None => dialog,
-            }
+                .child(view.clone())
         });
+        // The layer is drawn by our own render (see `Workspace::render`), so
+        // the workspace has to wake up for the dialog to appear.
         cx.notify();
-    }
-
-    fn submit_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match &self.dialog {
-            Some(Dialog::NewAgent {
-                project_path,
-                input,
-                planning,
-                ..
-            }) => {
-                if !*planning {
-                    let task = input.read(cx).value().trim().to_string();
-                    if !task.is_empty() {
-                        self.spawn_agent(project_path.clone(), task, window, cx);
-                    }
-                }
-            }
-            Some(Dialog::Search { .. }) => self.find_in_terminal(true, cx),
-            Some(Dialog::Settings { .. }) => self.save_settings(window, cx),
-            None => {}
-        }
     }
 }
 
@@ -3924,21 +3026,6 @@ fn parse_env(text: &str, vars: &[(String, String)]) -> Vec<(String, String)> {
         }
     }
     parsed
-}
-
-/// How much of a preset name a chip shows before eliding the rest.
-const CHIP_LABEL_CHARS: usize = 40;
-
-/// Shorten a label for a chip. Chips are pickers, not displays: a preset with
-/// a 200-character name would otherwise widen the row past the dialog, and
-/// layout-level truncation needs a resolved width that a wrapping chip row
-/// doesn't give it.
-fn ellipsize(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let kept: String = text.chars().take(max_chars.saturating_sub(1)).collect();
-    format!("{}…", kept.trim_end())
 }
 
 fn is_var_name(name: &str) -> bool {
@@ -4168,12 +3255,15 @@ impl Render for Workspace {
 /// The window's root view: the workspace, with gpui-component's dialog layer
 /// over it.
 ///
-/// `Root` owns the dialog state but renders only the view it is handed, so
-/// placing the layers is the app's job — and they cannot be placed inside
-/// [`Workspace::render`], because drawing a dialog calls back into the
-/// workspace to build its content and gpui refuses to update an entity that
-/// is already being updated. Hence a view of its own in between: it is being
-/// updated while the layer draws, and the workspace is not.
+/// `Root` owns the open dialog but renders only the view it is handed, so
+/// placing the layer is the app's job — and it deliberately does not happen
+/// in [`Workspace::render`]. This view separates "I am the workspace" from
+/// "I place the window's overlays", and it keeps a whole class of panic
+/// unreachable: the dialogs render themselves today, but should one ever
+/// read workspace state while it renders, drawing the layer from inside the
+/// workspace's own render would re-enter the workspace ("cannot update ...
+/// while it is already being updated"). Here the entity being updated is
+/// this one, and the workspace stays free.
 pub struct WindowRoot {
     workspace: Entity<Workspace>,
 }
@@ -4186,6 +3276,14 @@ impl WindowRoot {
 
 impl Render for WindowRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Our rem, not gpui-component's: `Root::render` has just set the
+        // window's rem from its own theme, and everything below — the
+        // workspace *and* the dialog layer's widgets — must scale with the
+        // app's font-size setting instead. The workspace sets the same value
+        // again for itself, but the layer renders here, not under the
+        // workspace, so without this its widgets would pick up the
+        // component library's rem.
+        window.set_rem_size(theme::rem_size(cx));
         div()
             .relative()
             .size_full()
@@ -4313,17 +3411,6 @@ mod tests {
     }
 
     #[test]
-    fn chip_labels_are_shortened_not_wide() {
-        assert_eq!(ellipsize("short", 10), "short");
-        assert_eq!(ellipsize("exactly-10", 10), "exactly-10");
-        assert_eq!(ellipsize("a-very-long-preset-name", 10), "a-very-lo…");
-        // Multi-byte input must not be split mid-character.
-        assert_eq!(ellipsize("äöüßäöüßäöüß", 5), "äöüß…");
-        // A trailing space before the ellipsis reads as a typo.
-        assert_eq!(ellipsize("word morewords", 6), "word…");
-    }
-
-    #[test]
     fn assignments_are_env_names_only() {
         assert_eq!(
             split_assignment("FOO=bar"),
@@ -4363,23 +3450,23 @@ mod tests {
             // the dialog layer is placed there, so a test window without it
             // would pass on dialogs the app never draws.
             let root = cx.new(|_| WindowRoot::new(workspace));
-            gpui_component::Root::new(gpui::AnyView::from(root), window, cx)
+            gpui_component::Root::new(root, window, cx)
         });
         let workspace = holder.borrow().clone().expect("workspace built");
         (workspace, cx)
     }
 
-    /// Opening a dialog has to reach the dialog layer, not just our own
-    /// state: the panel is rendered by `Root` now, so a dialog that only
-    /// existed in `self.dialog` would never appear.
+    /// Opening a dialog has to reach the dialog layer — the layer is the
+    /// only owner of "open", and a dialog it never shows does not exist.
     #[gpui::test]
     fn opening_a_dialog_puts_it_in_the_dialog_layer(cx: &mut gpui::TestAppContext) {
         let (workspace, cx) = test_window(cx);
 
         cx.update(|window, cx| {
-            workspace.update(cx, |this, cx| this.open_settings_dialog(window, cx))
+            workspace.update(cx, |this, cx| {
+                this.open_settings_dialog(window, cx);
+            })
         });
-        assert!(workspace.read_with(cx, |this, _| this.dialog.is_some()));
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
         // Holding the state is not the point: `Root` draws only the view it
         // is given, so a dialog whose layer nobody renders takes the keyboard
@@ -4392,7 +3479,6 @@ mod tests {
         );
 
         cx.update(|window, cx| workspace.update(cx, |this, cx| this.close_dialog(window, cx)));
-        assert!(workspace.read_with(cx, |this, _| this.dialog.is_none()));
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
     }
 
@@ -4403,21 +3489,11 @@ mod tests {
     fn opening_a_dialog_focuses_its_first_field(cx: &mut gpui::TestAppContext) {
         let (workspace, cx) = test_window(cx);
 
-        cx.update(|window, cx| {
+        let dialog = cx.update(|window, cx| {
             workspace.update(cx, |this, cx| this.open_settings_dialog(window, cx))
         });
 
-        let wanted = workspace.read_with(cx, |this, cx| match &this.dialog {
-            Some(Dialog::Settings {
-                preset_inputs,
-                focus_handle,
-                ..
-            }) => preset_inputs
-                .first()
-                .map(|first| first.name.focus_handle(cx))
-                .unwrap_or_else(|| focus_handle.clone()),
-            _ => panic!("settings dialog did not open"),
-        });
+        let wanted = dialog.read_with(cx, |dialog, cx| dialog.first_focus(cx));
         assert!(
             cx.update(|window, _| wanted.is_focused(window)),
             "the dialog took the keyboard off its own field"
@@ -4499,7 +3575,7 @@ mod tests {
 
         // Without a terminal on screen there is nothing to search, so the
         // dialog must not have opened at all.
-        assert!(workspace.read_with(cx, |this, _| this.dialog.is_none()));
+        assert!(workspace.read_with(cx, |this, _| this.search_dialog.is_none()));
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
     }
 }

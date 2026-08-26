@@ -43,6 +43,20 @@ fn ellipsize(text: &str, max_chars: usize) -> String {
     format!("{}…", kept.trim_end())
 }
 
+/// The label column every settings row shares. One width, so a row holding
+/// chips starts its controls in the same place as a row holding a field;
+/// one size, so neither reads louder than the other. Without it the rows
+/// drifted into three treatments — sized and aligned, sized only, aligned
+/// only — and the dialog looked ragged down its left edge.
+fn setting_label(text: impl Into<SharedString>) -> Div {
+    div()
+        .w_24()
+        .flex_none()
+        .text_color(theme::fg_dim())
+        .text_xs()
+        .child(text.into())
+}
+
 /// One selector chip, styled the same in every dialog. Drawn on the shared
 /// control metric (see [`crate::ui`]), so it is the same size as the field
 /// above it and says what it is with colour alone.
@@ -254,7 +268,9 @@ impl Render for NewAgentDialog {
         let mut panel = dialog_body("new-agent-body").child(ui::field(&self.input));
 
         // Preset selector.
-        let mut chips = div().flex().flex_wrap().items_center().gap_1().child(
+        // Same gap the settings dialog sets between a label and its chips,
+        // so a chip row reads the same wherever it appears.
+        let mut chips = div().flex().flex_wrap().items_center().gap_2().child(
             div()
                 .text_color(theme::fg_dim())
                 .text_sm()
@@ -277,7 +293,7 @@ impl Render for NewAgentDialog {
 
         // Workspace selector. The task description still names the agent in
         // every mode; this only picks where it works.
-        let mut modes = div().flex().flex_wrap().items_center().gap_1().child(
+        let mut modes = div().flex().flex_wrap().items_center().gap_2().child(
             div()
                 .text_color(theme::fg_dim())
                 .text_sm()
@@ -680,12 +696,7 @@ impl SettingsDialog {
             .flex()
             .items_center()
             .gap_2()
-            .child(
-                div()
-                    .text_color(theme::fg_dim())
-                    .text_sm()
-                    .child("Base font size"),
-            )
+            .child(setting_label("Base font size"))
             .child(
                 ui::control("font-size-dec")
                     .px_2()
@@ -735,7 +746,7 @@ impl SettingsDialog {
             .flex()
             .items_center()
             .gap_2()
-            .child(div().text_color(theme::fg_dim()).text_sm().child("Theme"))
+            .child(setting_label("Theme"))
             .child(theme_chip("Light", theme::ThemeMode::Light, cx))
             .child(theme_chip("Dark", theme::ThemeMode::Dark, cx))
     }
@@ -765,13 +776,7 @@ impl SettingsDialog {
             .flex_wrap()
             .items_center()
             .gap_2()
-            .child(
-                div()
-                    .w_24()
-                    .flex_none()
-                    .text_color(theme::fg_dim())
-                    .child("Preset"),
-            )
+            .child(setting_label("Preset"))
             .child(preset_chip("Default (claude)".into(), None, cx));
         for (index, inputs) in self.preset_inputs.iter().enumerate() {
             let name = inputs.name.read(cx).value().trim().to_string();
@@ -800,26 +805,12 @@ impl Render for SettingsDialog {
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(
-                    div()
-                        .w_24()
-                        .flex_none()
-                        .text_color(theme::fg_dim())
-                        .text_xs()
-                        .child(text),
-                )
+                .child(setting_label(text))
                 .child(div().flex_1().min_w_0().child(ui::field(input)))
         };
         let mut preset_list = div().flex().flex_col().gap_2();
         for (index, inputs) in self.preset_inputs.iter().enumerate() {
-            let label = |text: &'static str| {
-                div()
-                    .w_24()
-                    .flex_none()
-                    .text_color(theme::fg_dim())
-                    .text_xs()
-                    .child(text)
-            };
+            let label = |text: &'static str| setting_label(text);
             preset_list = preset_list.child(
                 div()
                     .flex()

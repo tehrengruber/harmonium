@@ -106,6 +106,9 @@ fn main() {
         // Component library: must be initialised before any of its widgets
         // are built, and it owns the window's root element (see `Root`).
         gpui_component::init(cx);
+        // Undoes the tab/shift-tab bindings the line above installs, but only
+        // over a terminal — where the key belongs to the shell.
+        terminal::view::init(cx);
         theme::sync_component_theme(cx);
 
         cx.on_window_closed(|cx| {

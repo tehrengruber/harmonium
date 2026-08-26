@@ -194,7 +194,7 @@ impl Workspace {
         cx.set_global(theme::FontSettings {
             base: state.settings.font_size,
         });
-        theme::set_mode(state.settings.theme);
+        theme::set_mode(state.settings.theme, cx);
         theme::set_fonts(&state.settings.ui_font, &state.settings.terminal_font);
         let mut workspace = Self {
             state,
@@ -356,8 +356,7 @@ impl Workspace {
     }
 
     fn set_theme(&mut self, mode: theme::ThemeMode, cx: &mut Context<Self>) {
-        theme::set_mode(mode);
-        theme::sync_component_theme(cx);
+        theme::set_mode(mode, cx);
         self.state.settings.theme = mode;
         self.persist(cx);
         let views: Vec<_> = self.terminals.values().cloned().collect();

@@ -67,13 +67,19 @@ fn font(family: SharedString) -> Font {
     }
 }
 
-pub fn set_mode(mode: ThemeMode) {
+/// Switch the palette, library included. The two are one setting: a dialog
+/// is our text on gpui-component's panel, so a mode that reaches only one of
+/// them is unreadable — which is what a saved dark theme used to look like,
+/// the library left on the light mode `init` gave it because the session's
+/// mode was applied after the one call that synced it.
+pub fn set_mode(mode: ThemeMode, cx: &mut App) {
     DARK.store(mode == ThemeMode::Dark, Ordering::Relaxed);
+    sync_component_theme(cx);
 }
 
 /// Point gpui-component's semantic theme at the same light/dark mode as our
-/// own palette, so library widgets and hand-painted chrome agree. Call after
-/// [`set_mode`] and once at startup.
+/// own palette. [`set_mode`] does this for you; call it directly only to
+/// align the library with the mode already in force, as at startup.
 pub fn sync_component_theme(cx: &mut App) {
     let mode = match mode() {
         ThemeMode::Dark => gpui_component::ThemeMode::Dark,

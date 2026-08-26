@@ -114,9 +114,18 @@ pub fn sync_component_theme(cx: &mut App) {
     // chrome beside the library's widgets has to guess at them to line
     // anything up. Until they are settable, this override stands.
     let radius = corner_radius(cx);
+    let ring = accent();
     let theme = gpui_component::Theme::global_mut(cx);
     theme.radius = radius;
     theme.radius_lg = radius;
+    // Focus reads as our accent, the way a selected chip or the spawn button
+    // does, rather than the library's near-black `ring` (`#0a0a0a` in its
+    // light theme). And no drop shadow under a field: `shadow_xs` puts a soft
+    // edge below the box and nothing above it, so against a focus border this
+    // heavy the bottom looked a different weight from the top — which is what
+    // an input looked like when it took focus.
+    theme.colors.ring = ring;
+    theme.shadow = false;
 }
 
 pub fn mode() -> ThemeMode {

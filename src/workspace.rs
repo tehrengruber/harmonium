@@ -15,7 +15,7 @@ use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use crate::log;
 use crate::planner;
 use crate::state::{
-    load_state, save_state, AgentId, AgentRecord, AppState, PresetRecord, ProjectRecord,
+    AgentId, AgentRecord, AppState, PresetRecord, ProjectRecord, SaveError, StateFile,
     TerminalTabRecord, WorkspaceMode,
 };
 use crate::state;
@@ -142,6 +142,12 @@ struct InlineEdit {
 
 pub struct Workspace {
     state: AppState,
+    /// Where `state` came from and where it goes back to.
+    state_file: StateFile,
+    /// Set once the state file has been found changed underneath us. Saving
+    /// stays refused from then on; this only keeps the log from filling with
+    /// the same complaint on every later save.
+    save_conflict: bool,
     /// Live terminals, keyed by terminal id: the agent's own terminal uses
     /// the agent id, extra shell tabs use their tab id.
     terminals: HashMap<String, Entity<TerminalView>>,
@@ -177,8 +183,11 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        let state = load_state();
+    /// Takes the loaded state rather than reading it: a state file that can't
+    /// be read stops harmonium before the window opens (see `main`), so by
+    /// here there is always a session to show. The handle it was read through
+    /// comes along, because saving needs to know what the file held then.
+    pub fn new(state: AppState, state_file: StateFile, cx: &mut Context<Self>) -> Self {
         cx.set_global(theme::FontSettings {
             base: state.settings.font_size,
         });
@@ -186,6 +195,8 @@ impl Workspace {
         theme::set_fonts(&state.settings.ui_font, &state.settings.terminal_font);
         let mut workspace = Self {
             state,
+            state_file,
+            save_conflict: false,
             terminals: HashMap::new(),
             terminal_subscriptions: HashMap::new(),
             active_tabs: HashMap::new(),
@@ -353,8 +364,22 @@ impl Workspace {
     }
 
     fn persist(&mut self, cx: &mut Context<Self>) {
-        if let Err(error) = save_state(&self.state) {
-            self.set_status(format!("Failed to save state: {error}"), true, cx);
+        match self.state_file.save(&self.state) {
+            Ok(()) => {}
+            // Somebody else wrote the state file. Nothing was lost — this
+            // session is parked next to it — but there is no way back from
+            // here in this process, so the banner is re-raised on every later
+            // save while the log keeps just the first one.
+            Err(error @ SaveError::Conflict { .. }) => {
+                let message = error.to_string();
+                if !self.save_conflict {
+                    self.save_conflict = true;
+                    log::error(message.clone());
+                }
+                self.status = Some((message, true));
+                cx.notify();
+            }
+            Err(error) => self.set_status(format!("Failed to save state: {error}"), true, cx),
         }
     }
 

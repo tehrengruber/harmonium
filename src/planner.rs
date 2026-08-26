@@ -586,8 +586,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        // Isolate harmonium's data dir for this test. Tests in this module run
-        // in one process; only this test touches the env var.
+        // Put the worktrees this test makes next to everything else it makes,
+        // so removing `base` at the end takes them with it. Isolation from a
+        // running harmonium doesn't depend on this line — `data_dir()` refuses
+        // to resolve to a real session under `cfg(test)` — but the cleanup
+        // does. Tests in this module run in one process; only this one touches
+        // the env var.
         std::env::set_var("HARMONIUM_DATA_DIR", base.join("data"));
 
         let run = |args: &[&str]| {

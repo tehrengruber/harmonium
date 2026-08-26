@@ -1,4 +1,5 @@
 mod assets;
+mod fatal;
 mod log;
 mod planner;
 mod state;
@@ -13,6 +14,40 @@ use gpui::{
 
 actions!(harmonium, [Quit, NewTerminalTab, SearchTerminal]);
 
+/// The saved session, claimed for this process — or a message and a non-zero
+/// exit. Both failures end the same way, because both would end in one session
+/// being written over another: a state file that can't be read would look like
+/// a fresh install and be saved over, and a second harmonium would race the
+/// first one's saves.
+fn load_state_or_exit() -> (state::StateFile, state::AppState) {
+    let error = match state::StateFile::load() {
+        Ok(loaded) => return loaded,
+        Err(error) => error,
+    };
+    let advice = match error {
+        state::LoadError::Locked { .. } => "Not starting: the two would each save their own \
+             session over the other's. Close the running one first."
+            .to_string(),
+        state::LoadError::Unreadable(_) => format!(
+            "Not starting: continuing would overwrite this file with a fresh state and lose the \
+             projects and presets in it. Move {} aside (or repair it) and start harmonium again.",
+            state::state_file().display()
+        ),
+    };
+    // The terminal first, and unconditionally: it costs nothing, it is what a
+    // launch from a shell wants, and it is still there if the window below
+    // can't be opened.
+    eprintln!("harmonium: {error}");
+    eprintln!("{advice}");
+    // Launched from a desktop file or a launcher there is no terminal to read
+    // that in, and an app that exits silently looks broken rather than refused.
+    fatal::show(
+        "Harmonium can't start",
+        vec![error.to_string().into(), advice.into()],
+    );
+    std::process::exit(1);
+}
+
 fn main() {
     env_logger::init();
     // Debug helper: `harmonium plan <repo> <task…>` prints the derived plan and
@@ -21,7 +56,15 @@ fn main() {
     if args.len() >= 4 && args[1] == "plan" {
         let repo = std::path::PathBuf::from(&args[2]);
         let task = args[3..].join(" ");
-        let settings = state::load_state().settings;
+        // Reads without claiming the session: this helper never saves, and
+        // should work while harmonium itself is running.
+        let settings = match state::read_state() {
+            Ok(state) => state.settings,
+            Err(error) => {
+                eprintln!("harmonium: {error:#}");
+                std::process::exit(1);
+            }
+        };
         // Same resolution as the UI: an explicit command, else the selected
         // agent preset, else the default. Preset environments are a UI concern
         // and stay out of this debug helper.
@@ -46,6 +89,10 @@ fn main() {
         }
         return;
     }
+
+    // Before anything is opened: a state file we can't read is fatal, and the
+    // message for it belongs on the terminal, not behind a window.
+    let (state_file, state) = load_state_or_exit();
 
     // gpui never quits on its own when the last window closes, so that is
     // ours to do. It must not happen inside gpui's window teardown: on X11
@@ -103,7 +150,7 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                let workspace = cx.new(workspace::Workspace::new);
+                let workspace = cx.new(|cx| workspace::Workspace::new(state, state_file, cx));
                 // A window-manager close (e.g. i3 `kill` sending
                 // WM_DELETE_WINDOW) only reaches us through this hook; gpui
                 // removes the window — and drops the workspace — before any

@@ -86,6 +86,22 @@ impl PresetRecord {
         )
     }
 
+    /// Give a sandboxed preset the git-root mount if it was saved before that
+    /// became a default. Without it the agent's worktree has no working git —
+    /// `.git` there is a file pointing into `<git root>/.git/worktrees/…`,
+    /// which the sandbox can't see — so this is repairing a broken sandbox,
+    /// not overriding a preference.
+    fn migrate_git_root_mount(&mut self) {
+        let Some(command) = with_git_root_mount(&self.command) else {
+            return;
+        };
+        crate::log::info(format!(
+            "preset `{}`: added the git root mount ({MOUNT_GIT_ROOT})",
+            self.name
+        ));
+        self.command = command;
+    }
+
     /// Fold a pre-`RESUME_FLAG` state file's second command line into this
     /// one. The old `resume_command` was the command repeated with a resume
     /// flag on the end; anything *between* the two was a separator the wrapper
@@ -113,6 +129,37 @@ impl PresetRecord {
             self.name
         ));
     }
+}
+
+/// Mounts the project's git root into a sandboxed agent at its own path. An
+/// agent's workdir is usually a worktree whose `.git` is a *file* pointing
+/// into `<git root>/.git/worktrees/…`, so a sandbox that sees only the workdir
+/// has no working git — and neither do the build caches that live next to it.
+/// `-v` is repeatable, understood by both of `claude-isol`'s modes, and must
+/// come before the `--` separator: everything after that goes to the agent.
+pub const MOUNT_GIT_ROOT: &str = "-v $HARMONIUM_TASK_GIT_ROOT:$HARMONIUM_TASK_GIT_ROOT";
+
+/// The sandbox wrapper the mount is meaningful for. Other commands are left
+/// alone: harmonium has no way to know how they spell a bind mount.
+const ISOLATION_WRAPPER: &str = "claude-isol";
+
+/// `command` with [`MOUNT_GIT_ROOT`] inserted, or `None` if it doesn't need it
+/// — not a sandboxed command, or already mounting the git root.
+///
+/// The fragment goes in front of the `--` separator when there is one, so it
+/// reaches the wrapper rather than the agent behind it. That also makes this
+/// correct for a stored resume command (`… -- --continue`), where appending
+/// would put the mount on the wrong side of the separator.
+fn with_git_root_mount(command: &str) -> Option<String> {
+    let program = command.split_whitespace().next()?;
+    let program = program.rsplit('/').next().unwrap_or(program);
+    if program != ISOLATION_WRAPPER || command.contains("HARMONIUM_TASK_GIT_ROOT") {
+        return None;
+    }
+    let mut words: Vec<&str> = command.split_whitespace().collect();
+    let at = words.iter().position(|word| *word == "--").unwrap_or(words.len());
+    words.splice(at..at, MOUNT_GIT_ROOT.split(' '));
+    Some(words.join(" "))
 }
 
 /// Appended to a preset's command to resume its session instead of starting a
@@ -215,16 +262,10 @@ fn program_available(program: &str) -> bool {
 /// it. This is a one-time seeding decision — installing `claude-isol` later
 /// doesn't retro-add them, since persisted presets are the user's own list.
 pub fn default_presets() -> Vec<PresetRecord> {
-    // The isolated presets mount the main repository at its own path: an
-    // agent's workdir is usually a worktree whose `.git` is a file pointing
-    // into `<git root>/.git/worktrees/…`, so a sandbox that sees only the
-    // workdir has no working git. `-v` is repeatable and understood by both
-    // modes (bubblewrap translates it to a bind), and it must come before the
-    // `--` separator — everything after that goes to claude.
-    // The isolated presets end in `--`: everything harmonium appends (the
+    // The isolated presets mount the main repository at its own path (see
+    // `MOUNT_GIT_ROOT`) and end in `--`: everything harmonium appends (the
     // task, --continue, the planner's flags) is meant for claude, not for
     // claude-isol, which rejects options it doesn't know.
-    const MOUNT_GIT_ROOT: &str = "-v $HARMONIUM_TASK_GIT_ROOT:$HARMONIUM_TASK_GIT_ROOT";
     let mut presets = vec![PresetRecord {
         name: "claude-code".into(),
         command: "claude".into(),
@@ -334,6 +375,17 @@ pub fn data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("HARMONIUM_DATA_DIR") {
         return PathBuf::from(dir);
     }
+    // A test must never end up on the directory a real harmonium is running
+    // out of. There it would take the session lock, save its own idea of the
+    // session over the file on the way out, or remove worktrees that live
+    // agents are sitting in. Tests that want somewhere to put files still set
+    // the variable; this is the floor under the ones that don't think about it
+    // at all. It does nothing for the *binary* under test — a harmonium
+    // launched by a GUI test is an ordinary release of it and needs
+    // `HARMONIUM_DATA_DIR` set for it.
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("harmonium-test-data-{}", std::process::id()));
+    }
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         return Path::new(&xdg).join("harmonium");
     }
@@ -353,31 +405,308 @@ pub fn terminal_history_path(terminal_id: &str) -> PathBuf {
     history_dir().join(format!("{terminal_id}.txt"))
 }
 
-fn state_file() -> PathBuf {
+pub fn state_file() -> PathBuf {
     data_dir().join("state.json")
 }
 
-pub fn load_state() -> AppState {
-    let path = state_file();
-    let mut state: AppState = match std::fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
-        Err(_) => AppState::default(),
-    };
-    for preset in &mut state.settings.presets {
-        preset.migrate_resume_command();
-    }
-    state
+/// Name of the copy a save is parked in when the state file turns out to have
+/// been written by something else. It sits next to the state file so both
+/// halves of the conflict are in one place.
+const REJECTED_FILE_NAME: &str = "state.rejected.json";
+
+/// The file a running harmonium holds a lock on, claiming the session.
+///
+/// A file of its own, rather than the lock being taken on `state.json`: a save
+/// replaces that file by rename, so a lock held on it would sit on an inode
+/// that is no longer at that path, and the next harmonium would lock the
+/// replacement and see nothing amiss.
+const LOCK_FILE_NAME: &str = "state.lock";
+
+/// The session file, together with the state harmonium last agreed with the
+/// disk on. Every save checks the file against that stamp first, so an edit
+/// made behind harmonium's back is refused instead of overwritten: the
+/// in-memory session is authoritative only for as long as nothing else writes
+/// the file.
+pub struct StateFile {
+    path: PathBuf,
+    /// `None` if the file wasn't there when last looked at.
+    stamp: Option<Stamp>,
+    /// Held open, and locked, for as long as this handle lives: it is what
+    /// keeps a second harmonium from opening the same session. Released by the
+    /// kernel when the process ends, however it ends.
+    _lock: std::fs::File,
 }
 
-pub fn save_state(state: &AppState) -> Result<()> {
-    let path = state_file();
+/// What the state file looked like when harmonium last read or wrote it.
+/// Modification time and length: a foreign write moves at least one of the
+/// two, unless it lands within the same filesystem timestamp tick *and* keeps
+/// the byte count exactly — which an edit from a person or another harmonium
+/// won't. Never persisted; only compared with another stamp from the same run.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+struct Stamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+impl Stamp {
+    /// The file's current stamp, or `None` if it isn't there.
+    fn of(path: &Path) -> Result<Option<Self>> {
+        match std::fs::metadata(path) {
+            Ok(meta) => Ok(Some(Self {
+                // Absent on filesystems that don't keep one, in which case the
+                // length carries the comparison on its own.
+                modified: meta.modified().ok(),
+                len: meta.len(),
+            })),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("checking {}", path.display())),
+        }
+    }
+}
+
+/// Why the session couldn't be opened.
+#[derive(Debug)]
+pub enum LoadError {
+    /// Another harmonium has it. Two of them would each save their own idea of
+    /// the session over the other's, so the second one doesn't start.
+    Locked { path: PathBuf },
+    /// Missing is fine and yields a default session; this is the file being
+    /// there but unreadable, or in a format this version can't parse.
+    Unreadable(anyhow::Error),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Locked { path } => write!(
+                f,
+                "another harmonium is already running (it holds {})",
+                path.display()
+            ),
+            Self::Unreadable(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+/// Why a save didn't happen.
+#[derive(Debug)]
+pub enum SaveError {
+    /// The file changed since harmonium last read or wrote it. Nothing was
+    /// written to it; the session went to `rejected` instead, unless writing
+    /// that failed too.
+    Conflict {
+        path: PathBuf,
+        rejected: Option<PathBuf>,
+    },
+    Io(anyhow::Error),
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict {
+                path,
+                rejected: Some(rejected),
+            } => write!(
+                f,
+                "{} changed on disk — not saving over it. This session was written to {} instead; \
+                 merge the two and restart harmonium.",
+                path.display(),
+                rejected.display()
+            ),
+            Self::Conflict {
+                path,
+                rejected: None,
+            } => write!(
+                f,
+                "{} changed on disk — not saving over it, and the copy of this session could not \
+                 be written either (see the log). Nothing is being saved.",
+                path.display()
+            ),
+            Self::Io(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+/// Read the saved session without claiming it, for callers that only look and
+/// never save. They mustn't be kept out by a running harmonium — and, taking no
+/// lock, they may see a session that changes under them.
+pub fn read_state() -> Result<AppState> {
+    Ok(read_at(&state_file())?.unwrap_or_default())
+}
+
+/// The parsed contents of `path`, or `None` if there is no file there. A
+/// missing file is a fresh install; anything else — unreadable, or written by a
+/// version whose format this one doesn't understand — is an error rather than a
+/// silent default, because the caller would go on to save over the file and
+/// take every project and preset in it with them.
+fn read_at(path: &Path) -> Result<Option<AppState>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    parse_state(&contents)
+        .with_context(|| format!("parsing {}", path.display()))
+        .map(Some)
+}
+
+impl StateFile {
+    /// Claim the saved session and read it. Fails if another harmonium holds
+    /// it, or if the file is there but can't be read (see `read_at`).
+    pub fn load() -> Result<(Self, AppState), LoadError> {
+        Self::load_from(state_file())
+    }
+
+    fn load_from(path: PathBuf) -> Result<(Self, AppState), LoadError> {
+        let lock = claim(&path)?;
+        // Under the lock, so the only writer that can slip between the read and
+        // the stamp is one that isn't harmonium.
+        let state = read_at(&path).map_err(LoadError::Unreadable)?;
+        let stamp = Stamp::of(&path).map_err(LoadError::Unreadable)?;
+        Ok((
+            Self {
+                path,
+                stamp,
+                _lock: lock,
+            },
+            state.unwrap_or_default(),
+        ))
+    }
+
+    /// Replace the file's contents with `state` — unless somebody else has
+    /// written it since this handle last looked, in which case neither side is
+    /// lost: the file is left alone and the session is parked next to it.
+    pub fn save(&mut self, state: &AppState) -> Result<(), SaveError> {
+        let json = serde_json::to_string_pretty(state)
+            .context("serialising the session")
+            .map_err(SaveError::Io)?;
+        if self.changed_on_disk().map_err(SaveError::Io)? {
+            return Err(SaveError::Conflict {
+                path: self.path.clone(),
+                rejected: self.write_rejected(&json),
+            });
+        }
+        write_atomic(&self.path, &json).map_err(SaveError::Io)?;
+        // Stamping what was just written can only fail if the file went away
+        // again underneath us. Keeping the old stamp then makes the next save
+        // refuse, which is the safe way round.
+        self.stamp = Stamp::of(&self.path).unwrap_or(self.stamp);
+        Ok(())
+    }
+
+    /// Whether the file is something other than what this handle put there (or
+    /// read from it).
+    fn changed_on_disk(&self) -> Result<bool> {
+        match Stamp::of(&self.path)? {
+            // Gone. Whoever removed it — or moved it aside, which is exactly
+            // what harmonium asks for when a state file won't parse — left
+            // nothing behind to destroy, so recreating it costs nobody data.
+            None => Ok(false),
+            found => Ok(found != self.stamp),
+        }
+    }
+
+    /// Park a save that would have clobbered somebody else's write. The
+    /// previous rejected copy is overwritten rather than kept: saves keep
+    /// arriving for as long as the session runs, and it is the newest one that
+    /// is worth reconciling.
+    fn write_rejected(&self, json: &str) -> Option<PathBuf> {
+        let path = self.path.with_file_name(REJECTED_FILE_NAME);
+        match write_atomic(&path, json) {
+            Ok(()) => Some(path),
+            Err(error) => {
+                crate::log::error(format!("could not write {}: {error:#}", path.display()));
+                None
+            }
+        }
+    }
+}
+
+/// Take the session lock that goes with the state file at `path`. The returned
+/// handle holds it; dropping it, or the process ending, releases it.
+fn claim(path: &Path) -> Result<std::fs::File, LoadError> {
+    let lock_path = path.with_file_name(LOCK_FILE_NAME);
+    let open = || -> Result<std::fs::File> {
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("opening {}", lock_path.display()))
+    };
+    let file = open().map_err(LoadError::Unreadable)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(LoadError::Locked { path: lock_path }),
+        // Advisory locks aren't supported here (some network filesystems).
+        // Refusing to start over that would be worse than the race it
+        // prevents, so this only gets a note in the log.
+        Err(std::fs::TryLockError::Error(error)) => {
+            crate::log::error(format!(
+                "could not lock {}: {error} — another harmonium could overwrite this session",
+                lock_path.display()
+            ));
+            Ok(file)
+        }
+    }
+}
+
+/// Write `contents` to `path` by way of a temporary file in the same directory.
+/// A reader then sees either the whole old file or the whole new one, and a
+/// crash mid-write can't leave a half-written session behind — which, now that
+/// an unparseable state file stops harmonium, would be a session that refuses
+/// to start.
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let json = serde_json::to_string_pretty(state)?;
-    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    // The pid keeps two harmoniums from writing one temporary file.
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(name);
+    let written = std::fs::write(&tmp, contents)
+        .with_context(|| format!("writing {}", tmp.display()))
+        .and_then(|()| {
+            std::fs::rename(&tmp, path)
+                .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))
+        });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+fn parse_state(contents: &str) -> Result<AppState> {
+    let mut state: AppState = serde_json::from_str(contents)?;
+    for preset in &mut state.settings.presets {
+        preset.migrate_resume_command();
+        preset.migrate_git_root_mount();
+    }
+    // Agents snapshot their preset's command line at spawn, so fixing the
+    // presets alone would leave every agent that already exists resuming into
+    // a sandbox with no git. The snapshot is there to keep *preference*
+    // changes away from running agents; a missing mount isn't one.
+    for agent in state.projects.iter_mut().flat_map(|p| p.agents.iter_mut()) {
+        for command in [&mut agent.command, &mut agent.resume_command]
+            .into_iter()
+            .filter_map(Option::as_mut)
+        {
+            if let Some(mounted) = with_git_root_mount(command) {
+                crate::log::info(format!(
+                    "agent `{}`: added the git root mount to `{command}`",
+                    agent.name
+                ));
+                *command = mounted;
+            }
+        }
+    }
+    Ok(state)
 }
 
 
@@ -446,6 +775,238 @@ mod tests {
         let mut p = preset("claude", Some("claude --resume deadbeef"));
         p.migrate_resume_command();
         assert_eq!(p.command, "claude");
+    }
+
+    #[test]
+    fn sandboxed_commands_gain_the_git_root_mount() {
+        // Before the separator, so the wrapper gets it and not the agent.
+        assert_eq!(
+            with_git_root_mount("claude-isol --local --").unwrap(),
+            format!("claude-isol --local {MOUNT_GIT_ROOT} --")
+        );
+        // A stored resume command has words on both sides of the separator.
+        assert_eq!(
+            with_git_root_mount("claude-isol --local -- --continue").unwrap(),
+            format!("claude-isol --local {MOUNT_GIT_ROOT} -- --continue")
+        );
+        // Pre-separator command lines: nothing to insert in front of.
+        assert_eq!(
+            with_git_root_mount("claude-isol").unwrap(),
+            format!("claude-isol {MOUNT_GIT_ROOT}")
+        );
+        // Invoked by path.
+        assert!(with_git_root_mount("/opt/bin/claude-isol --")
+            .unwrap()
+            .contains(MOUNT_GIT_ROOT));
+
+        // Already mounting it — including under a hand-written mount that
+        // spells the same variable differently.
+        assert_eq!(with_git_root_mount("claude-isol -v $HARMONIUM_TASK_GIT_ROOT:/repo --"), None);
+        assert_eq!(
+            with_git_root_mount(&format!("claude-isol {MOUNT_GIT_ROOT} --")),
+            None
+        );
+        // Not a sandboxed command: harmonium doesn't know how these spell a
+        // bind mount, so it leaves them alone.
+        assert_eq!(with_git_root_mount("claude"), None);
+        assert_eq!(with_git_root_mount("docker run claude-isol"), None);
+        assert_eq!(with_git_root_mount(""), None);
+    }
+
+    #[test]
+    fn saved_presets_and_agents_are_migrated_on_load() {
+        let state = parse_state(
+            r#"{
+                "projects": [{
+                    "path": "/repo", "name": "repo", "agents": [{
+                        "id": "a", "name": "fix-login", "description": "…",
+                        "workdir": "/worktrees/fix-login", "branch": "fix-login",
+                        "command": "claude-isol --local --",
+                        "resume_command": "claude-isol --local -- --continue"
+                    }]
+                }],
+                "settings": {"presets": [{"name": "isolated", "command": "claude-isol --local --"}]}
+            }"#,
+        )
+        .unwrap();
+
+        let preset = &state.settings.presets[0];
+        assert_eq!(preset.command, format!("claude-isol --local {MOUNT_GIT_ROOT} --"));
+        assert_eq!(
+            preset.resume_command(),
+            format!("claude-isol --local {MOUNT_GIT_ROOT} -- {RESUME_FLAG}")
+        );
+
+        // The agent's own snapshot too, or it would resume without git.
+        let agent = &state.projects[0].agents[0];
+        assert_eq!(
+            agent.resume_command.as_deref().unwrap(),
+            format!("claude-isol --local {MOUNT_GIT_ROOT} -- --continue")
+        );
+        assert!(agent.command.as_deref().unwrap().contains(MOUNT_GIT_ROOT));
+    }
+
+    #[test]
+    fn state_that_does_not_parse_is_reported_not_defaulted() {
+        // A file from a version whose format this one doesn't know: reading it
+        // as an empty session would wipe every project and preset on the next
+        // save, so it has to come back as an error.
+        assert!(parse_state(r#"{"projects": "not a list"}"#).is_err());
+        assert!(parse_state("").is_err());
+        // Truncated by a crash mid-write.
+        assert!(parse_state(r#"{"projects": [{"path": "/repo""#).is_err());
+
+        // Unknown fields from a newer version are still readable, though —
+        // only what serde genuinely can't map is fatal.
+        let state = parse_state(r#"{"projects": [], "future_field": 7}"#).unwrap();
+        assert!(state.projects.is_empty());
+    }
+
+    /// A private directory for one test. The state file is addressed by path
+    /// here rather than through `HARMONIUM_DATA_DIR`, so these tests don't race
+    /// the other modules' tests over one process-wide variable.
+    fn temp_dir(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "harmonium-state-{}-{test}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn state_with_project(path: &str) -> AppState {
+        AppState {
+            projects: vec![ProjectRecord::new(PathBuf::from(path))],
+            ..AppState::default()
+        }
+    }
+
+    /// Read a state file back without taking the lock the live handle holds.
+    fn reload(path: &Path) -> AppState {
+        read_at(path).unwrap().unwrap()
+    }
+
+    #[test]
+    fn saving_replaces_the_file_it_last_wrote() {
+        let file = temp_dir("save").join("nested/state.json");
+        let (mut handle, state) = StateFile::load_from(file.clone()).unwrap();
+        // Nothing there yet: the parent directory is created on the way.
+        assert!(state.projects.is_empty());
+        handle.save(&state_with_project("/one")).unwrap();
+        handle.save(&state_with_project("/two")).unwrap();
+
+        assert_eq!(reload(&file).projects[0].path, PathBuf::from("/two"));
+        // Every write goes through a temporary file, and none is left behind.
+        let strays: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "state.json" && name != LOCK_FILE_NAME)
+            .collect();
+        assert!(strays.is_empty(), "left behind {strays:?}");
+    }
+
+    #[test]
+    fn a_second_harmonium_does_not_get_the_session() {
+        let file = temp_dir("lock").join("state.json");
+        let (first, _) = StateFile::load_from(file.clone()).unwrap();
+        match StateFile::load_from(file.clone()) {
+            Err(LoadError::Locked { path }) => {
+                assert_eq!(path, file.with_file_name(LOCK_FILE_NAME))
+            }
+            Err(error) => panic!("expected the session to be locked, got {error}"),
+            Ok(_) => panic!("expected the session to be locked"),
+        }
+        // Looking without claiming is always allowed — `harmonium plan` does it
+        // while the app is running.
+        assert!(read_at(&file).unwrap().is_none());
+
+        // The lock goes with the handle, so quitting hands the session on.
+        drop(first);
+        assert!(StateFile::load_from(file).is_ok());
+    }
+
+    #[test]
+    fn a_foreign_write_is_parked_not_overwritten() {
+        let dir = temp_dir("conflict");
+        let file = dir.join("state.json");
+        let (mut handle, _) = StateFile::load_from(file.clone()).unwrap();
+        handle.save(&state_with_project("/mine")).unwrap();
+
+        // Somebody edits the file behind harmonium's back — the jq splice, an
+        // editor, a second harmonium.
+        let theirs = r#"{"projects": [{"path": "/theirs", "name": "theirs", "agents": []}]}"#;
+        std::fs::write(&file, theirs).unwrap();
+
+        let rejected = match handle.save(&state_with_project("/mine")) {
+            Err(SaveError::Conflict { rejected, .. }) => rejected.unwrap(),
+            other => panic!("expected a conflict, got {other:?}"),
+        };
+        // Neither side is lost: their file stands, ours is next to it.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), theirs);
+        assert_eq!(rejected, dir.join(REJECTED_FILE_NAME));
+        assert_eq!(reload(&rejected).projects[0].path, PathBuf::from("/mine"));
+
+        // And it stays refused for the rest of the session — the later save is
+        // the one that ends up parked, not an extra file.
+        assert!(matches!(
+            handle.save(&state_with_project("/mine-again")),
+            Err(SaveError::Conflict { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), theirs);
+        assert_eq!(
+            reload(&rejected).projects[0].path,
+            PathBuf::from("/mine-again")
+        );
+    }
+
+    #[test]
+    fn a_state_file_that_is_only_read_still_counts_as_ours() {
+        let file = temp_dir("reload").join("state.json");
+        std::fs::write(
+            &file,
+            r#"{"projects": [{"path": "/repo", "name": "repo", "agents": []}]}"#,
+        )
+        .unwrap();
+        // Loaded, then saved without anyone else touching it: no conflict,
+        // even though what harmonium writes back isn't byte-identical to what
+        // it read (migrations, formatting).
+        let (mut handle, state) = StateFile::load_from(file).unwrap();
+        handle.save(&state).unwrap();
+        handle.save(&state).unwrap();
+    }
+
+    #[test]
+    fn a_deleted_state_file_is_recreated() {
+        let file = temp_dir("deleted").join("state.json");
+        let (mut handle, _) = StateFile::load_from(file.clone()).unwrap();
+        handle.save(&state_with_project("/one")).unwrap();
+        // Moving it aside is what harmonium tells people to do; there is
+        // nothing left to clobber, so this is not a conflict.
+        std::fs::remove_file(&file).unwrap();
+        handle.save(&state_with_project("/two")).unwrap();
+        assert_eq!(reload(&file).projects[0].path, PathBuf::from("/two"));
+    }
+
+    /// The floor under every test in this crate: whatever `HARMONIUM_DATA_DIR`
+    /// happens to be — unset, or pointed somewhere by another module's test —
+    /// a test process must not resolve to the directory a real harmonium runs
+    /// out of, where it would take that session's lock, save over its state
+    /// file, or delete worktrees agents are working in.
+    #[test]
+    fn a_test_never_lands_on_the_real_data_dir() {
+        let real = std::env::var("XDG_DATA_HOME")
+            .map(|xdg| PathBuf::from(xdg).join("harmonium"))
+            .or_else(|_| {
+                std::env::var("HOME").map(|home| PathBuf::from(home).join(".local/share/harmonium"))
+            });
+        if let Ok(real) = real {
+            assert_ne!(
+                data_dir(),
+                real,
+                "a test would be working in the running harmonium's data directory"
+            );
+        }
     }
 
     #[test]

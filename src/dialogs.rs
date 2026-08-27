@@ -83,7 +83,7 @@ fn chip(id: impl Into<ElementId>, selected: bool) -> Stateful<Div> {
 /// How much of the window's height a dialog may cover. gpui-component drops
 /// its shell a tenth of the window down (`Dialog`'s default `margin_top`,
 /// dialog.rs:367), and this leaves about as much free underneath.
-const DIALOG_WINDOW_FRACTION: f32 = 0.8;
+pub const DIALOG_WINDOW_FRACTION: f32 = 0.8;
 
 /// What the shell adds around a dialog's own frame: 24px of padding above and
 /// below (`Edges::all(px(24.))`, dialog.rs:373), its 1px border, and a little
@@ -107,6 +107,24 @@ const MIN_DIALOG_HEIGHT: Pixels = px(160.);
 /// growing off the screen.
 pub fn max_shell_height(window: &Window) -> Pixels {
     (window.viewport_size().height * DIALOG_WINDOW_FRACTION).max(MIN_DIALOG_HEIGHT)
+}
+
+/// How wide each dialog wants to be, in rems — so it grows with the text it
+/// holds, the way its height is a fraction of the window rather than a count
+/// of pixels. Fixed pixel widths looked right only at the scale and font size
+/// they were drawn at: the same 620px is 58 rems of text at font size 8 and
+/// 33 at size 14, which is the difference between roomy and cramped.
+/// At the default font size these are the 620/560/460px they replace.
+pub const SETTINGS_WIDTH: f32 = 38.75;
+pub const NEW_AGENT_WIDTH: f32 = 35.;
+pub const SEARCH_WIDTH: f32 = 28.75;
+
+/// A dialog's width: what it asks for, capped so it never outgrows the
+/// window — the same fraction its height is held to.
+pub fn shell_width(rems: f32, window: &Window, cx: &App) -> Pixels {
+    let wanted = f32::from(theme::rem_size(cx)) * rems;
+    let cap = f32::from(window.viewport_size().width) * DIALOG_WINDOW_FRACTION;
+    px(wanted.min(cap))
 }
 
 /// A dialog's outer frame: a column no taller than the window can show, with

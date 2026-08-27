@@ -21,6 +21,7 @@ use crate::dialogs::{
     NewAgentDialog, NewAgentEvent, SearchDialog, SearchEvent, SettingsDialog, SettingsEvent,
     SettingsValues,
 };
+use crate::dialogs;
 use crate::log;
 use crate::planner;
 use crate::state::{
@@ -917,7 +918,12 @@ impl Workspace {
         })
         .detach();
         let focus = dialog.read(cx).first_focus(cx);
-        self.present_dialog(dialog, px(560.), window, cx);
+        self.present_dialog(
+            dialog,
+            dialogs::shell_width(dialogs::NEW_AGENT_WIDTH, window, cx),
+            window,
+            cx,
+        );
         // After presenting, never before: opening the dialog layer focuses
         // the dialog itself, which would take the keyboard off the field.
         window.focus(&focus);
@@ -948,7 +954,12 @@ impl Workspace {
         // the terminal keeps focus and typing goes into the PTY behind the
         // dialog.
         let focus = dialog.read(cx).first_focus(cx);
-        self.present_dialog(dialog.clone(), px(620.), window, cx);
+        self.present_dialog(
+            dialog.clone(),
+            dialogs::shell_width(dialogs::SETTINGS_WIDTH, window, cx),
+            window,
+            cx,
+        );
         window.focus(&focus);
         // Handed back for the focus test; every in-app caller drops it.
         dialog
@@ -1314,7 +1325,12 @@ impl Workspace {
         })
         .detach();
         let focus = dialog.read(cx).first_focus(cx);
-        self.present_dialog(dialog, px(460.), window, cx);
+        self.present_dialog(
+            dialog,
+            dialogs::shell_width(dialogs::SEARCH_WIDTH, window, cx),
+            window,
+            cx,
+        );
         window.focus(&focus);
     }
 
@@ -2981,12 +2997,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let view = view.into();
+        let max_width = px(
+            f32::from(window.viewport_size().width) * crate::dialogs::DIALOG_WINDOW_FRACTION,
+        );
         window.open_dialog(cx, move |dialog, window, _cx| {
             dialog
                 .w(width)
                 // Never wider than the window; a long preset name used to
-                // push the buttons off the edge.
-                .max_w(px(920.))
+                // push the buttons off the edge. `width` is already held to
+                // this, so it only catches a caller that asked for more.
+                .max_w(max_width)
                 // Nor taller than it: gpui-component's shell has no maximum
                 // height of its own, so without this the panel grows with its
                 // content until the buttons are off the bottom of the screen.

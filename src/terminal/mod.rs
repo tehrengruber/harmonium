@@ -1046,6 +1046,12 @@ fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> 
     };
 
     let bytes = match keystroke.key.as_str() {
+        // Shift-enter and alt-enter mean "newline, don't submit" to a TUI that
+        // reads a multi-line prompt (Claude Code among them), but a bare CR is
+        // indistinguishable from plain enter and submits instead. Send the
+        // escape-prefixed CR terminals emit for alt-enter — the same sequence
+        // Claude Code's own `/terminal-setup` binds shift-enter to elsewhere.
+        "enter" if mods.shift || mods.alt => b"\x1b\r".to_vec(),
         "enter" => vec![b'\r'],
         "tab" if mods.shift => b"\x1b[Z".to_vec(),
         "tab" => vec![b'\t'],
@@ -1284,6 +1290,21 @@ mod tests {
         assert_eq!(escape_regex("fn main()"), r"fn main\(\)");
         assert_eq!(escape_regex(r"C:\tmp"), r"C:\\tmp");
         assert_eq!(escape_regex("plain"), "plain");
+    }
+
+    /// A bare CR is what plain enter sends, so a TUI reading a multi-line
+    /// prompt — Claude Code's among them — submits on shift-enter instead of
+    /// wrapping. The modified chords have to arrive as something else.
+    #[test]
+    fn modified_enter_asks_for_a_newline() {
+        let bytes = |keys: &str| {
+            keystroke_to_bytes(&Keystroke::parse(keys).unwrap(), TermMode::default())
+        };
+        assert_eq!(bytes("enter"), Some(b"\r".to_vec()));
+        assert_eq!(bytes("shift-enter"), Some(b"\x1b\r".to_vec()));
+        assert_eq!(bytes("alt-enter"), Some(b"\x1b\r".to_vec()));
+        // ctrl-enter keeps sending a plain CR: shells and TUIs read it as enter.
+        assert_eq!(bytes("ctrl-enter"), Some(b"\r".to_vec()));
     }
 
     #[test]

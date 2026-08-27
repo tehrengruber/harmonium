@@ -116,6 +116,7 @@ pub fn max_shell_height(window: &Window) -> Pixels {
 /// 33 at size 14, which is the difference between roomy and cramped.
 /// At the default font size these are the 620/560/460px they replace.
 pub const SETTINGS_WIDTH: f32 = 38.75;
+pub const CONFIRM_WIDTH: f32 = 26.;
 pub const NEW_AGENT_WIDTH: f32 = 35.;
 pub const SEARCH_WIDTH: f32 = 28.75;
 
@@ -368,6 +369,68 @@ impl Render for NewAgentDialog {
 }
 
 // ---- Terminal search ----
+
+pub enum ConfirmEvent {
+    Confirm,
+    Cancel,
+}
+
+/// A yes/no in front of something that cannot be undone. It only asks — the
+/// workspace holds what to do and does it if this says yes, so the same
+/// dialog serves every such action without knowing about any of them.
+pub struct ConfirmDialog {
+    question: SharedString,
+    detail: Option<SharedString>,
+    confirm_label: &'static str,
+    focus_handle: FocusHandle,
+}
+
+impl ConfirmDialog {
+    pub fn new(
+        question: impl Into<SharedString>,
+        detail: Option<SharedString>,
+        confirm_label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            question: question.into(),
+            detail,
+            confirm_label,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    /// The panel itself: there is no field to type in, and the dialog still
+    /// has to hold the keyboard so escape reaches it rather than the
+    /// terminal behind it.
+    pub fn first_focus(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<ConfirmEvent> for ConfirmDialog {}
+
+impl Render for ConfirmDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        dialog_frame(window)
+            .track_focus(&self.focus_handle)
+            .child(div().text_color(theme::fg()).child(self.question.clone()))
+            .when_some(self.detail.clone(), |frame, detail| {
+                frame.child(
+                    div()
+                        .text_color(theme::fg_dim())
+                        .text_xs()
+                        .child(detail),
+                )
+            })
+            .child(dialog_buttons(
+                self.confirm_label,
+                cx,
+                |_, _, cx| cx.emit(ConfirmEvent::Cancel),
+                |_, _, cx| cx.emit(ConfirmEvent::Confirm),
+            ))
+    }
+}
 
 pub enum SearchEvent {
     /// Run one search step through the terminal behind the dialog.

@@ -18,6 +18,7 @@ use gpui_component::input::{InputEvent, InputState, SelectAll};
 use gpui_component::WindowExt as _;
 
 use crate::dialogs::{
+    ConfirmDialog, ConfirmEvent,
     NewAgentDialog, NewAgentEvent, SearchDialog, SearchEvent, SettingsDialog, SettingsEvent,
     SettingsValues,
 };
@@ -1296,6 +1297,41 @@ impl Workspace {
         self.open_search_dialog(window, cx);
     }
 
+    /// Put a yes/no in front of `action`. The pending action lives in this
+    /// subscription rather than in a field on the workspace: it is needed
+    /// exactly once, when the dialog answers, and a field would be a second
+    /// place for "what is being confirmed" to disagree with the dialog on
+    /// screen.
+    fn confirm(
+        &mut self,
+        question: impl Into<SharedString>,
+        detail: Option<SharedString>,
+        confirm_label: &'static str,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dialog = cx.new(|cx| ConfirmDialog::new(question, detail, confirm_label, cx));
+        cx.subscribe_in(&dialog, window, move |this, _, event, window, cx| match event {
+            ConfirmEvent::Confirm => {
+                // Closed first: the action may open a dialog of its own, and
+                // may report a failure into the status line behind this one.
+                this.close_dialog(window, cx);
+                action(this, window, cx);
+            }
+            ConfirmEvent::Cancel => this.close_dialog(window, cx),
+        })
+        .detach();
+        let focus = dialog.read(cx).first_focus(cx);
+        self.present_dialog(
+            dialog,
+            dialogs::shell_width(dialogs::CONFIRM_WIDTH, window, cx),
+            window,
+            cx,
+        );
+        window.focus(&focus);
+    }
+
     fn open_search_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Nothing to search in without a live terminal on screen.
         if self.selected.as_ref().and_then(|id| self.active_terminal(id)).is_none() {
@@ -2191,6 +2227,7 @@ impl Workspace {
                         None => theme::fg_dim(),
                     };
                     let remove_id = agent.id.clone();
+                    let remove_name = agent.name.clone();
                     let edit_id = agent.id.clone();
                     let hovered_row = HoveredRow::Agent(agent.id.clone());
                     let is_hovered = self.hovered_row.as_ref() == Some(&hovered_row);
@@ -2332,8 +2369,21 @@ impl Workspace {
                                     theme::fg_dim(),
                                     theme::error(),
                                     "×",
-                                    move |this, _window, cx| {
-                                        this.remove_agent(remove_id.clone(), cx)
+                                    move |this, window, cx| {
+                                        let id = remove_id.clone();
+                                        this.confirm(
+                                            format!("Remove agent “{remove_name}”?"),
+                                            Some(
+                                                "Its terminals are closed and its worktree \
+                                                 removed. The branch is kept, and uncommitted \
+                                                 changes block the removal."
+                                                    .into(),
+                                            ),
+                                            "Remove",
+                                            move |this, _, cx| this.remove_agent(id.clone(), cx),
+                                            window,
+                                            cx,
+                                        )
                                     },
                                     cx,
                                 ))
@@ -2678,6 +2728,7 @@ impl Workspace {
              cx: &Context<Self>| {
                 let tab_id: SharedString = format!("tab-{id}").into();
                 let tab_id_for_close = id.to_string();
+                let close_label = label.clone();
                 let owner_id = agent_id.clone();
                 let mut tab = div()
                     .id(tab_id)
@@ -2786,9 +2837,20 @@ impl Workspace {
                             .ml_1()
                             .text_color(theme::fg_dim())
                             .hover(|s| s.text_color(theme::error()))
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                this.remove_terminal_tab(owner_id.clone(), tab_id_for_close.clone(), cx);
+                                let owner = owner_id.clone();
+                                let tab = tab_id_for_close.clone();
+                                this.confirm(
+                                    format!("Close terminal “{close_label}”?"),
+                                    Some("Its scrollback is discarded.".into()),
+                                    "Close",
+                                    move |this, _, cx| {
+                                        this.remove_terminal_tab(owner.clone(), tab.clone(), cx)
+                                    },
+                                    window,
+                                    cx,
+                                );
                             }))
                             .child("×"),
                     );
